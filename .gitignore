@@ -1,0 +1,19 @@
+# 本机私有：settings.local.json 含本地绝对路径与个人授权列表，
+# plans/projects 是会话记录。整个目录忽略——只列已知子路径的话，
+# 将来多出的文件（如 settings.json、hooks）会漏网
+.claude/
+
+# 发布产物（由 Jenkinsfile 生成后即删）
+dist.tar.gz
+.dist/
+# 截图/临时渲染产物（下划线前缀是本地调试约定，勿提交）
+_*.png
+_*.html
+
+# 编辑器与系统垃圾
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~

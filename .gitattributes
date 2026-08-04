@@ -1,0 +1,34 @@
+# 全仓行尾统一 LF：index 与工作区一致，防 Windows 工具把未覆盖类型漂成 CRLF
+# 本仓库风险最高的是 tcpo——CRLF 会让它在 Linux 上直接跑不起来（shebang 后带 \r）
+* text=auto eol=lf
+
+# 语法/指纹敏感，显式钉死 LF。
+# tcpo 与 VERSION 无扩展名，必须逐个列出——只靠上面的 * 通配虽然也是 LF，
+# 但这两个是主脚本与版本号文件，值得显式声明而不是依赖兜底规则
+tcpo text eol=lf
+VERSION text eol=lf
+*.sh text eol=lf
+*.bash text eol=lf
+Jenkinsfile text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.conf text eol=lf
+*.txt text eol=lf
+
+# Windows 专用脚本必须保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制不做行尾转换。注意 binary 宏 = -text -diff，只 unset text 不 unset eol，
+# 故 check-attr 会显示残留 eol=lf；text 为 unset 时 git 完全跳过行尾转换，该残留无效果，勿据此误判
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.gz binary
+*.zip binary

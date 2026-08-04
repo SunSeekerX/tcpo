@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tcpo · 跨境链路内核调优面板</title>
+<meta name="description" content="面向跨境链路（长肥网络）的 Linux 内核网络参数调优面板。纯 bash，无依赖，可完整回退。">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230d1117'/><text x='8' y='12' font-family='monospace' font-size='9' fill='%233fb950' text-anchor='middle'>to</text></svg>">
+<link rel="stylesheet" href="style.css">
+<script>
+// 语言在 <head> 里同步定下来，避免正文闪一下再切
+// 首次访问跟随浏览器语言（navigator.language 与 Accept-Language 同源），之后跟随手动选择
+document.documentElement.dataset.lang =
+    localStorage.getItem('lang') || (navigator.language.indexOf('zh') === 0 ? 'zh' : 'en')
+</script>
+</head>
+<body>
+
+<nav class="lang">
+    <button data-set-lang="zh">中文</button><button data-set-lang="en">EN</button>
+</nav>
+
+<main>
+
+<header>
+    <h1>tcpo</h1>
+    <p class="tagline">
+        <span data-l="zh">跨境链路内核调优面板 · 纯 bash · 无依赖 · 可完整回退</span>
+        <span data-l="en">Linux kernel network tuning for long fat networks · pure bash · no deps · fully reversible</span>
+    </p>
+    <!-- 故意只有 en：中文读者不需要被告知面板是中文的，这是全站唯一不成对的 data-l -->
+    <p class="note" data-l="en">Note: the panel UI itself is in Chinese.</p>
+</header>
+
+<section>
+    <div class="cmd">
+        <code>bash &lt;(curl -sL https://tcp.itssx.com/tcpo)</code>
+        <button data-copy="bash <(curl -sL https://tcp.itssx.com/tcpo)">
+            <span class="idle" data-l="zh">复制</span><span class="idle" data-l="en">Copy</span>
+            <span class="done" data-l="zh">已复制</span><span class="done" data-l="en">Copied</span>
+        </button>
+    </div>
+    <p class="hint">
+        <span data-l="zh">需要 root。首次运行自装到 <code>/usr/local/bin/tcpo</code>，之后任意目录敲 <code>tcpo</code> 打开面板。默认不自动更新，只在启动时查一次有没有新版并提示。</span>
+        <span data-l="en">Requires root. First run installs itself to <code>/usr/local/bin/tcpo</code>; type <code>tcpo</code> anywhere afterwards. It never auto-updates — it only checks for a newer version at startup and tells you.</span>
+    </p>
+</section>
+
+<section>
+    <h2>
+        <span data-l="zh">目标机没有外网怎么装</span>
+        <span data-l="en">Installing without internet access</span>
+    </h2>
+    <p>
+        <span data-l="zh">脚本是单个文件、无第三方依赖，所以离线安装就是「把一个文件传上去」。在能上网的机器上执行下面任一条拿到 <code>tcpo</code>：</span>
+        <span data-l="en">The script is a single file with no third-party dependencies, so offline installation is just "copy one file over". On a machine with internet access, get <code>tcpo</code> with either of these:</span>
+    </p>
+    <div class="cmd">
+        <code>curl -fL -o tcpo https://tcp.itssx.com/tcpo</code>
+        <button data-copy="curl -fL -o tcpo https://tcp.itssx.com/tcpo">
+            <span class="idle" data-l="zh">复制</span><span class="idle" data-l="en">Copy</span>
+            <span class="done" data-l="zh">已复制</span><span class="done" data-l="en">Copied</span>
+        </button>
+    </div>
+    <p class="hint">
+        <span data-l="zh">用 <code>wget</code> 的话是 <code>wget https://tcp.itssx.com/tcpo</code>。浏览器点 <a href="tcpo">这个链接</a> 也能拿到同一个文件（建议下载后先通读一遍再执行，这是个要 root 跑的脚本）。</span>
+        <span data-l="en">With <code>wget</code>: <code>wget https://tcp.itssx.com/tcpo</code>. <a href="tcpo">This link</a> gives you the same file from a browser (worth reading through before running it — this script needs root).</span>
+    </p>
+    <p>
+        <span data-l="zh">传到目标机并安装（三步，在<b>本地</b>执行前两步）：</span>
+        <span data-l="en">Upload and install (three steps; run the first two <b>locally</b>):</span>
+    </p>
+    <pre><code><span data-l="zh"># 1. 传上去。把 root@1.2.3.4 换成你的机器</span><span data-l="en"># 1. Upload. Replace root@1.2.3.4 with your host</span>
+scp tcpo root@1.2.3.4:/root/
+
+<span data-l="zh"># 2. 登上去</span><span data-l="en"># 2. Log in</span>
+ssh root@1.2.3.4
+
+<span data-l="zh"># 3. 在目标机上运行（会自装到 /usr/local/bin/tcpo）</span><span data-l="en"># 3. Run it there (installs itself to /usr/local/bin/tcpo)</span>
+bash /root/tcpo</code></pre>
+    <p class="hint">
+        <span data-l="zh">本地文件执行时脚本<b>不联网</b>，直接复制自身到 <code>/usr/local/bin/tcpo</code>。装完就能敲 <code>tcpo</code>。</span>
+        <span data-l="en">When run from a local file the script <b>does not touch the network</b> — it copies itself to <code>/usr/local/bin/tcpo</code>. After that, <code>tcpo</code> works.</span>
+    </p>
+    <p>
+        <span data-l="zh">没有 <code>scp</code>（比如只有网页版控制台或跳板机）时，用剪贴板也行：在目标机上敲下面这段，粘贴脚本内容后按 <code>Ctrl-D</code> 结束：</span>
+        <span data-l="en">No <code>scp</code> (web console only, or a bastion in between)? The clipboard works too. On the target box, run this, paste the script content, then press <code>Ctrl-D</code>:</span>
+    </p>
+    <pre><code>cat &gt; /root/tcpo &lt;&lt;'TCPSH_EOF'
+<span data-l="zh"># 粘贴 tcpo 全文，然后 Ctrl-D</span><span data-l="en"># paste the full tcpo here, then Ctrl-D</span>
+TCPSH_EOF
+bash /root/tcpo</code></pre>
+    <p class="hint">
+        <span data-l="zh">用 <code>&lt;&lt;'TCPSH_EOF'</code> 而不是 <code>&lt;&lt;TCPSH_EOF</code>：加引号才不会让 shell 展开脚本里的 <code>$</code> 变量和反引号，否则粘进去的内容会被改坏。粘完建议核对一下大小，应与网页上显示的一致：<code>wc -c /root/tcpo</code>。</span>
+        <span data-l="en">Use <code>&lt;&lt;'TCPSH_EOF'</code>, not <code>&lt;&lt;TCPSH_EOF</code> — the quotes stop the shell from expanding <code>$</code> variables and backticks in the script, which would otherwise corrupt what you paste. Afterwards, check the size matches: <code>wc -c /root/tcpo</code>.</span>
+    </p>
+    <p class="hint">
+        <span data-l="zh">离线机上菜单 7（在线更新）和启动时的版本检查都会失败——这是预期的，检查失败静默跳过，不影响任何功能。想彻底关掉检查（不让脚本联网）设环境变量：<code>TCP_DASHBOARD_NO_CHECK=1</code>。要升级就重复上面的流程覆盖一次。</span>
+        <span data-l="en">On an offline box, menu 7 (online update) and the startup version check will fail — that's expected; a failed check is silently skipped and affects nothing. To disable the check entirely (no network calls at all), set <code>TCP_DASHBOARD_NO_CHECK=1</code>. To upgrade, just repeat the steps above and overwrite.</span>
+    </p>
+    <p class="hint">
+        <span data-l="zh">另外注意：脚本本身无依赖，但部分<b>功能</b>要用 <code>ss</code> / <code>nstat</code> / <code>tc</code> / <code>ethtool</code> / <code>ping</code> 这些系统工具。写入类菜单（1-5、9）缺了会尝试自动安装，只读菜单（8/a/b）不主动装、只提示手动补装命令（唯一例外是菜单 a 的 <code>iperf3</code>，会先问你一次）。目标机连软件源也不通的话，写入类菜单的自动安装也会失败，相关功能降级并说明影响（面板会明确告诉你缺哪个、少了什么能力），核心的 sysctl 与 BBR 配置不受影响。</span>
+        <span data-l="en">One more thing: the script itself has no dependencies, but some <b>features</b> need system tools like <code>ss</code>, <code>nstat</code>, <code>tc</code>, <code>ethtool</code>, and <code>ping</code>. The writing menus (1-5, 9) try to install what's missing; the read-only ones (8/a/b) install nothing on their own and just print a manual install command (the sole exception is <code>iperf3</code> in menu a, which asks you first). If the box can't reach a package mirror either, even those installs fail — the affected features degrade with an explanation (the panel tells you exactly what's missing and what capability is lost). The core sysctl and BBR configuration is unaffected.</span>
+    </p>
+</section>
+
+<section>
+    <h2>
+        <span data-l="zh">功能</span>
+        <span data-l="en">Menu</span>
+    </h2>
+    <dl class="menu">
+        <dt class="key">9</dt>
+        <dd>
+            <span data-l="zh"><b>一键全部</b>：先问角色（普通业务 / 中转节点）和带宽，再依次跑 1+2+3+5</span>
+            <span data-l="en"><b>Do everything</b>: asks for role (regular / transit node) and bandwidth, then runs 1+2+3+5</span>
+        </dd>
+
+        <dt class="key">1</dt>
+        <dd>
+            <span data-l="zh">IPv4 优先解析（改 <code>/etc/gai.conf</code>，避免 IPv6 绕路导致的握手延迟）</span>
+            <span data-l="en">Prefer IPv4 resolution (edits <code>/etc/gai.conf</code>, avoids handshake latency from IPv6 detours)</span>
+        </dd>
+
+        <dt class="key">2</dt>
+        <dd>
+            <span data-l="zh">BBR + FQ（模块未加载时自动 <code>modprobe tcp_bbr</code> 并持久化）</span>
+            <span data-l="en">BBR + FQ (auto <code>modprobe tcp_bbr</code> and persist if not loaded)</span>
+        </dd>
+
+        <dt class="key">3</dt>
+        <dd>
+            <span data-l="zh">内核参数 · 保守档（缓冲区 / 队列容量 / 连接回收，<b>不开 IP 转发</b>）</span>
+            <span data-l="en">Kernel params · conservative (buffers / queue capacity / connection reuse, <b>no IP forwarding</b>)</span>
+        </dd>
+
+        <dt class="key">4</dt>
+        <dd>
+            <span data-l="zh">内核参数 · 中转档（保守档 + IP 转发 + MSS Clamp，仅中转 / 代理 / 隧道节点）</span>
+            <span data-l="en">Kernel params · transit (conservative + IP forwarding + MSS clamp, transit / proxy / tunnel nodes only)</span>
+        </dd>
+
+        <dt class="key">5</dt>
+        <dd>
+            <span data-l="zh">网卡队列（RPS / RFS / XPS，含开机自动生效的 systemd 单元）</span>
+            <span data-l="en">NIC queues (RPS / RFS / XPS, with a systemd unit for boot-time replay)</span>
+        </dd>
+
+        <dt class="key ro">8</dt>
+        <dd>
+            <span data-l="zh"><b>瓶颈诊断</b>（只读）：判断调 sysctl 到底有没有用</span>
+            <span data-l="en"><b>Bottleneck diagnosis</b> (read-only): tells you whether tuning sysctl would help at all</span>
+        </dd>
+
+        <dt class="key ro">a</dt>
+        <dd>
+            <span data-l="zh"><b>调优效果测量</b>（只读）：时间窗内的计数器增量对比</span>
+            <span data-l="en"><b>Effect measurement</b> (read-only): counter deltas compared over a time window</span>
+        </dd>
+
+        <dt class="key ro">b</dt>
+        <dd>
+            <span data-l="zh"><b>MTU / PMTU 探测</b>（只读）：查路径有没有 MTU 黑洞</span>
+            <span data-l="en"><b>MTU / PMTU probe</b> (read-only): checks the path for MTU black holes</span>
+        </dd>
+
+        <dt class="key">6</dt>
+        <dd>
+            <span data-l="zh">回退全部优化（还原到首次运行前的<b>真实值</b>，不是猜的默认值）</span>
+            <span data-l="en">Roll back everything (restores the <b>actual</b> pre-run values, not guessed defaults)</span>
+        </dd>
+
+        <dt class="key">7</dt>
+        <dd>
+            <span data-l="zh">在线更新脚本（<b>手动触发</b>，脚本从不自动更新自己）</span>
+            <span data-l="en">Update the script online (<b>manual only</b> — it never updates itself)</span>
+        </dd>
+
+        <dt class="key">q</dt>
+        <dd>
+            <span data-l="zh">卸载面板（同时回退并清理状态目录）</span>
+            <span data-l="en">Uninstall (also rolls back and clears the state directory)</span>
+        </dd>
+    </dl>
+    <p class="hint">
+        <span data-l="zh">标灰的 8 / a / b 是<b>零副作用</b>的只读功能：不装包、不改配置、不重启服务，生产机可直接跑。缺 <code>ss</code>/<code>nstat</code> 之类的工具时相关指标跳过并给出手动补装命令，不会替你装。唯一的例外要你自己点头：菜单 a 里如果指定了压测对端且没装 <code>iperf3</code>，会问一次要不要装（压测会产生真实流量），答 N 就只做被动观测。</span>
+        <span data-l="en">8 / a / b (greyed) are <b>side-effect free</b>: no packages installed, no config touched, no services restarted. Safe on production. If tools like <code>ss</code> or <code>nstat</code> are missing, the affected metrics are skipped and you get a manual install command — nothing is installed for you. One exception needs your explicit yes: in menu a, if you name a peer to benchmark against and <code>iperf3</code> is absent, it asks once (benchmarking generates real traffic); answer N and it stays passive-observation only.</span>
+    </p>
+</section>
+
+<section>
+    <h2>
+        <span data-l="zh">为什么要调</span>
+        <span data-l="en">Why tune</span>
+    </h2>
+    <p>
+        <span data-l="zh">Linux 默认网络参数是给局域网设计的，在高带宽高延迟的跨境链路上有两个瓶颈：</span>
+        <span data-l="en">Linux network defaults are designed for LANs. On high-bandwidth, high-latency cross-border links there are two bottlenecks:</span>
+    </p>
+    <ul>
+        <li>
+            <span data-l="zh"><b>缓冲区太小</b>：默认 <code>rmem_max</code> / <code>wmem_max</code> 只有 212KB。所需窗口 = 带宽 × RTT（BDP），1Gbps × 200ms ÷ 8 ≈ 25MB，默认值差两个数量级，链路跑不满。</span>
+            <span data-l="en"><b>Buffers too small</b>: default <code>rmem_max</code> / <code>wmem_max</code> is only 212KB. Required window = bandwidth × RTT (BDP); 1Gbps × 200ms ÷ 8 ≈ 25MB. Two orders of magnitude short, so the link never fills.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>Cubic 见丢包就砍速</b>：跨境公网晚高峰 5% 以内的随机丢包是常态，Cubic 一遇丢包就把发送速率减半。BBR 改为实时测量链路真实容量与延迟，管道没满就继续发，不被随机丢包误导。</span>
+            <span data-l="en"><b>Cubic halves on any loss</b>: a few percent of random loss is normal on cross-border links at peak hours, and Cubic halves its rate on every loss event. BBR measures actual capacity and latency instead, and isn't misled by random loss.</span>
+        </li>
+    </ul>
+    <p>
+        <span data-l="zh">这两条不是推导，是实测的。<code>test/effect-test.sh</code> 用 netem 造出可控的长肥链路，在<b>同一条链路上</b>对比参数：</span>
+        <span data-l="en">These aren't derivations, they're measured. <code>test/effect-test.sh</code> builds a controlled long fat link with netem and compares settings <b>on the same link</b>:</span>
+    </p>
+    <div class="scroll">
+    <table>
+        <thead>
+            <tr>
+                <th><span data-l="zh">场景</span><span data-l="en">Scenario</span></th>
+                <th><span data-l="zh">调优前</span><span data-l="en">Before</span></th>
+                <th><span data-l="zh">调优后</span><span data-l="en">After</span></th>
+                <th><span data-l="zh">倍数</span><span data-l="en">Gain</span></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><span data-l="zh">RTT 160ms + 1.5% 丢包，CUBIC → BBR</span><span data-l="en">RTT 160ms + 1.5% loss, CUBIC → BBR</span></td>
+                <td>1.2-1.6 Mbps</td><td>113-121 Mbps</td><td class="gain">68-95×</td>
+            </tr>
+            <tr>
+                <td><span data-l="zh">RTT 200ms 无丢包，缓冲区 256KB → 64MB</span><span data-l="en">RTT 200ms no loss, buffers 256KB → 64MB</span></td>
+                <td>14-16 Mbps</td><td>110-124 Mbps</td><td class="gain">6.8-9.2×</td>
+            </tr>
+            <tr>
+                <td><span data-l="zh">RTT 180ms + 1% 丢包，跑完菜单 2+3</span><span data-l="en">RTT 180ms + 1% loss, after menu 2+3</span></td>
+                <td>1.1-3.3 Mbps</td><td>105-112 Mbps</td><td class="gain">32-98×</td>
+            </tr>
+            <tr>
+                <td><span data-l="zh">RTT 200ms，空闲 8 秒后恢复（<code>slow_start_after_idle</code> 1→0）</span><span data-l="en">RTT 200ms, recovery after 8s idle (<code>slow_start_after_idle</code> 1→0)</span></td>
+                <td>189-190 Mbps</td><td>309-324 Mbps</td><td class="gain">1.6-1.7×</td>
+            </tr>
+        </tbody>
+    </table>
+    </div>
+    <p class="hint">
+        <span data-l="zh">有个反向对照值得看：<b>同样 160ms RTT 但不加丢包</b>时，CUBIC 141 Mbps、BBR 237 Mbps，只差 68%。所以 BBR 不是「总是快 80 倍」，它的价值是<b>不被随机丢包误导</b>——线路干净时两者本来就在同一量级。倍数区间宽是因为容器内绝对吞吐受宿主负载影响，测试只断言同一次运行内的相对关系。</span>
+        <span data-l="en">A reverse control is worth noting: at the <b>same 160ms RTT but with no loss</b>, CUBIC hits 141 Mbps and BBR 237 Mbps — only 68% apart. BBR isn't "always 80× faster"; its value is <b>not being misled by random loss</b>. On a clean link the two are in the same league. The ranges are wide because absolute throughput inside a container depends on host load, so the tests only assert relative results within a single run.</span>
+    </p>
+</section>
+
+<section>
+    <h2>
+        <span data-l="zh">缓冲区是怎么算的</span>
+        <span data-l="en">How buffers are sized</span>
+    </h2>
+    <p>
+        <span data-l="zh">按 <b>BDP</b>（带宽 × 延迟）算，不是拍内存百分比：</span>
+        <span data-l="en">From <b>BDP</b> (bandwidth × delay), not from a percentage of RAM:</span>
+    </p>
+    <pre><code>BDP(bytes) = <span data-l="zh">带宽Mbps</span><span data-l="en">Mbps</span> × 125 × RTT_ms
+<span data-l="zh">缓冲区上限</span><span data-l="en">buffer ceiling</span> = BDP × 2.5<span data-l="zh">，再受总内存 5% 约束，钳到 [8MB, 256MB]</span><span data-l="en">, capped at 5% of total RAM, clamped to [8MB, 256MB]</span></code></pre>
+    <p>
+        <span data-l="zh">RTT 由脚本 ping 三个公共地址取最小值实测（失败则按跨境典型值 150ms），带宽问你。按内存百分比算是代理指标：同一台 2G 内存的机器，跑 1Gbps/10ms 的同城线和 100Mbps/250ms 的跨境线，需要的窗口差 20 倍，但按内存算会得到同一个值。乘 2.5 是留给丢包重传期间的在途数据。</span>
+        <span data-l="en">RTT is measured by pinging three public addresses and taking the minimum (falling back to a typical 150ms for cross-border links); bandwidth is asked. Sizing by RAM percentage is a proxy metric: on the same 2GB box, a 1Gbps/10ms local link and a 100Mbps/250ms cross-border link need windows 20× apart, yet RAM-based sizing gives both the same number. The 2.5× headroom covers data in flight during loss recovery.</span>
+    </p>
+</section>
+
+<section>
+    <h2>
+        <span data-l="zh">可完整回退</span>
+        <span data-l="en">Fully reversible</span>
+    </h2>
+    <p>
+        <span data-l="zh">只做文件级、可完整回退的改动：sysctl drop-in、<code>gai.conf</code>、<code>limits.d</code>、<code>/sys</code> 队列设置、iptables 规则。判据是<b>最坏情况必须停在「参数没生效」</b>，不能是「用户重启后开不了机」——本面板经 SSH 使用，出事即失联无法自救。</span>
+        <span data-l="en">Only file-level, fully reversible changes: sysctl drop-ins, <code>gai.conf</code>, <code>limits.d</code>, <code>/sys</code> queue settings, iptables rules. The rule is that <b>the worst case must be "the setting didn't take effect"</b>, never "the box won't boot" — this panel is used over SSH, and a failure means losing access with no way to recover.</span>
+    </p>
+    <ul>
+        <li>
+            <span data-l="zh"><b>先快照再改</b>：菜单 2/3/4/5 任一入口都会先记录改动前的<b>真实运行值</b>，回退时逐个写回。快照读不到的 key 记为 <code>ABSENT</code> 并跳过，不用硬编码默认值兜底——机器原本可能就在跑 reno，发行版默认也可能是 <code>fq_codel</code>，猜错就是改成了另一个状态。</span>
+            <span data-l="en"><b>Snapshot before writing</b>: menus 2/3/4/5 all record the <b>actual running values</b> first and write them back on rollback. Keys missing from the snapshot are marked <code>ABSENT</code> and skipped rather than filled with hardcoded defaults — the box may have been running reno, and the distro default may be <code>fq_codel</code>; guessing wrong means leaving it in a third state.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>删文件不等于回退</b>：<code>sysctl --system</code> 只应用「文件里还写着的」值，对已删除的 key 不做任何事。所以回退是两步：删配置 + 跑 <code>--system</code>，再逐个写回快照值。中转档的 <code>ip_forward=1</code> 遗留意味着机器还在当路由器转包，回退最后会单独确认它。</span>
+            <span data-l="en"><b>Deleting the file is not a rollback</b>: <code>sysctl --system</code> only applies values still present in files and does nothing for removed keys. So rollback is two steps: delete the configs and run <code>--system</code>, then write each snapshot value back. A leftover <code>ip_forward=1</code> from the transit profile means the box is still routing packets, so rollback verifies that one explicitly at the end.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>冲突配置逐行注释，不禁用整个文件</b>：发行版和加固包常把不相关的参数放在同一个 <code>.conf</code> 里，整文件移走会把无关的安全参数一起停掉。原文件先整份备份，清单落盘。</span>
+            <span data-l="en"><b>Conflicts are commented line by line</b>, never by disabling whole files: distros and hardening packages often mix unrelated parameters into one <code>.conf</code>, and moving the file away would also disable unrelated security settings. The original is backed up in full and the list is recorded on disk.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>写进去不等于生效</b>：被后加载文件覆盖、内核不支持该参数、模块没加载，三种情况都静默失败。菜单 3/4 跑完会逐项比对「配置文件写的」与「<code>sysctl</code> 实际读到的」，分三类报：已生效 / 不一致（红字）/ 本内核无此参数。</span>
+            <span data-l="en"><b>Written ≠ effective</b>: being overridden by a later-loaded file, an unsupported parameter, or an unloaded module all fail silently. After menus 3/4, every key written is compared against what <code>sysctl</code> actually reads back, reported in three buckets: effective / mismatched (in red) / not supported by this kernel.</span>
+        </li>
+    </ul>
+</section>
+
+<section>
+    <h2>
+        <span data-l="zh">不做什么</span>
+        <span data-l="en">Out of scope</span>
+    </h2>
+    <ul>
+        <li>
+            <span data-l="zh"><b>不换内核</b>（XanMod BBRv3 / BBRplus / 锐速那类）。最坏情况是重启后开不了机，与「可完整回退」的性质冲突。要装请单独找专门的脚本，并确保不删旧内核、不自动重启。</span>
+            <span data-l="en"><b>No kernel replacement</b> (XanMod BBRv3, BBRplus, and friends). The worst case there is a box that won't boot, which contradicts being fully reversible. Use a dedicated script for that, and make sure it keeps the old kernel and doesn't auto-reboot.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>不编译内核模块</b>（<code>tcp_brutal</code> 之类只做检测提示），<b>不集成隧道 / FEC</b>。</span>
+            <span data-l="en"><b>No kernel module compilation</b> (things like <code>tcp_brutal</code> are only detected and reported), <b>no bundled tunnels or FEC</b>.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>不做全能管理面板</b>：SSH 加固、防火墙、swap、DNS、流媒体检测、跑分一律不加。</span>
+            <span data-l="en"><b>Not an all-in-one control panel</b>: no SSH hardening, firewall, swap, DNS, streaming unlock checks, or benchmarks.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>每个参数都要有权威依据</b>（内核文档 / 红帽 tuned / Cloudflare / ESnet 之一），社区脚本的流行度不构成依据。<b>「故意不设」与「设了」同等重要</b>——不设的参数在配置文件末尾注释区记录原因，防止后续版本当遗漏补上。</span>
+            <span data-l="en"><b>Every parameter needs an authoritative source</b> (kernel docs, Red Hat tuned, Cloudflare, or ESnet); popularity among community scripts doesn't count. <b>Deliberate omissions matter as much as what's set</b> — skipped parameters are documented with reasons in a comment block at the end of the config file, so a later version doesn't "fix" them back in.</span>
+        </li>
+    </ul>
+</section>
+
+<section>
+    <h2>
+        <span data-l="zh">兼容性</span>
+        <span data-l="en">Compatibility</span>
+    </h2>
+    <p>
+        <span data-l="zh">六大发行版系（Debian / Ubuntu / RHEL / openSUSE / Arch / Alpine）容器测试覆盖。只用 POSIX 工具与 bash 内建，awk 不用 GNU 扩展（mawk 是 Debian/Ubuntu 默认）。写入类菜单缺工具时自动装（<code>ping</code> / <code>ss</code> / <code>ethtool</code> / <code>iptables</code>），覆盖 <code>apt-get</code> / <code>dnf</code> / <code>yum</code> / <code>zypper</code> / <code>pacman</code> / <code>apk</code> 六种包管理器，装不上才降级并说明影响；只读菜单不主动装任何包，唯一例外是会产生真实流量的 <code>iperf3</code>——菜单 a 里指定了压测对端时会先问你一次。</span>
+        <span data-l="en">Container-tested across six distro families (Debian / Ubuntu / RHEL / openSUSE / Arch / Alpine). Uses only POSIX tools and bash builtins; no GNU awk extensions (mawk is the Debian/Ubuntu default). The writing menus install what they need if missing (<code>ping</code>, <code>ss</code>, <code>ethtool</code>, <code>iptables</code>) across all six package managers — <code>apt-get</code>, <code>dnf</code>, <code>yum</code>, <code>zypper</code>, <code>pacman</code>, <code>apk</code> — and only degrade if that fails; the read-only menus install nothing on their own — the sole exception is <code>iperf3</code>, which generates real traffic and asks you first when menu a needs it.</span>
+    </p>
+</section>
+
+<footer>
+    <p>
+        <a href="https://github.com/SunSeekerX/tcpo">GitHub</a>
+        <span class="sep">·</span>
+        <a href="https://github.com/SunSeekerX/tcpo#readme"><span data-l="zh">完整文档</span><span data-l="en">Full docs</span></a>
+        <span class="sep">·</span>
+        <a href="tcpo"><span data-l="zh">查看脚本</span><span data-l="en">View source</span></a>
+        <span class="sep">·</span>
+        MIT
+    </p>
+    <p class="hint">
+        <span data-l="zh">fork 自 <a href="https://github.com/666shen/tcp-dashboard">666shen/tcp-dashboard</a>。别拿生产机试写入类菜单，只读的 8 / a / b 随便跑。</span>
+        <span data-l="en">Forked from <a href="https://github.com/666shen/tcp-dashboard">666shen/tcp-dashboard</a>. Don't try the writing menus on a production box; the read-only 8 / a / b are fine anywhere.</span>
+    </p>
+</footer>
+
+</main>
+
+<script>
+document.querySelectorAll('[data-copy]').forEach((el) => {
+    el.onclick = async () => {
+        await navigator.clipboard.writeText(el.dataset.copy)
+        el.classList.add('copied')
+        setTimeout(() => el.classList.remove('copied'), 1500)
+    }
+})
+document.querySelectorAll('[data-set-lang]').forEach((el) => {
+    el.onclick = () => {
+        const lang = el.dataset.setLang
+        localStorage.setItem('lang', lang)
+        document.documentElement.dataset.lang = lang
+        document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en'
+    }
+})
+</script>
+
+</body>
+</html>
