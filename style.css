@@ -16,6 +16,10 @@
     --fg-strong: #e6edf3;
     --accent: #3fb950;
     --accent-dim: #238636;
+    /* 面板里三态状态标记的对应色，与脚本的 GREEN/YELLOW/RED 一致，
+       让网页上的说明和用户在终端里看到的颜色对得上 */
+    --warn: #d29922;
+    --bad: #f85149;
     color-scheme: dark;
 
     /* 正文用圆润无衬线，命令与参数名仍走 --mono。
@@ -372,6 +376,27 @@ td.gain {
     color: var(--accent);
     font-weight: 600;
     white-space: nowrap;
+}
+
+/* --- 面板状态标记（正文里引用终端上的三态显示）--- */
+
+.ok,
+.warn,
+.bad {
+    font-family: var(--mono);
+    white-space: nowrap;
+}
+
+.ok {
+    color: var(--accent);
+}
+
+.warn {
+    color: var(--warn);
+}
+
+.bad {
+    color: var(--bad);
 }
 
 /* --- 页脚 --- */

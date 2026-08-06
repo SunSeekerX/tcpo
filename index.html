@@ -44,6 +44,14 @@ document.documentElement.dataset.lang =
         <span data-l="zh">需要 root。首次运行自装到 <code>/usr/local/bin/tcpo</code>，之后任意目录敲 <code>tcpo</code> 打开面板。默认不自动更新，只在启动时查一次有没有新版并提示。</span>
         <span data-l="en">Requires root. First run installs itself to <code>/usr/local/bin/tcpo</code>; type <code>tcpo</code> anywhere afterwards. It never auto-updates — it only checks for a newer version at startup and tells you.</span>
     </p>
+    <!-- [人工决策-2026-08-05 14:22:07] 首屏命令保持 bash <(curl ...) 不改成管道形式：
+         root 下这条最好（stdin 保留 tty，装完直接进交互菜单）。代价是普通用户看到
+         「需要 root」会本能加 sudo 然后撞上 /proc/self/fd/NN 报错，所以在这里补说明，
+         而不是为了迁就 sudo 去换掉首屏命令。此段与脚本的 fd 行为绑定，勿删 -->
+    <p class="hint">
+        <span data-l="zh">非 root 用户请先 <code>sudo -i</code> 切过去再执行，<b>不要</b>写成 <code>sudo bash &lt;(curl ...)</code>——那样会报 <code>/proc/self/fd/NN: No such file or directory</code>。原因是 <code>&lt;(...)</code> 是当前 shell 打开的管道，<code>sudo</code> 会关掉继承来的文件描述符，与本脚本无关。想一条命令搞定就用管道形式：<code>curl -sL https://tcp.itssx.com/tcpo | sudo bash</code>。</span>
+        <span data-l="en">If you're not root, run <code>sudo -i</code> first — do <b>not</b> write <code>sudo bash &lt;(curl ...)</code>, which fails with <code>/proc/self/fd/NN: No such file or directory</code>. The reason is that <code>&lt;(...)</code> is a pipe opened by your current shell and <code>sudo</code> closes inherited file descriptors; it has nothing to do with this script. For a one-liner, use the pipe form instead: <code>curl -sL https://tcp.itssx.com/tcpo | sudo bash</code>.</span>
+    </p>
 </section>
 
 <section>
@@ -124,8 +132,8 @@ bash /root/tcpo</code></pre>
 
         <dt class="key">2</dt>
         <dd>
-            <span data-l="zh">BBR + FQ（模块未加载时自动 <code>modprobe tcp_bbr</code> 并持久化）</span>
-            <span data-l="en">BBR + FQ (auto <code>modprobe tcp_bbr</code> and persist if not loaded)</span>
+            <span data-l="zh">BBR + FQ（模块未加载时自动 <code>modprobe tcp_bbr</code>，并按本机是否有 systemd 如实报持久化结果）</span>
+            <span data-l="en">BBR + FQ (auto <code>modprobe tcp_bbr</code> if not loaded, and reports persistence honestly based on whether this box has systemd)</span>
         </dd>
 
         <dt class="key">3</dt>
@@ -142,8 +150,14 @@ bash /root/tcpo</code></pre>
 
         <dt class="key">5</dt>
         <dd>
-            <span data-l="zh">网卡队列（RPS / RFS / XPS，含开机自动生效的 systemd 单元）</span>
-            <span data-l="en">NIC queues (RPS / RFS / XPS, with a systemd unit for boot-time replay)</span>
+            <span data-l="zh">网卡队列（RPS / RFS / XPS，开机生效走 systemd 单元；无 systemd 时改为生成重放脚本并告知挂法）</span>
+            <span data-l="en">NIC queues (RPS / RFS / XPS; boot-time replay via a systemd unit, or a generated replay script plus instructions when there's no systemd)</span>
+        </dd>
+
+        <dt class="key">c</dt>
+        <dd>
+            <span data-l="zh">qdisc 立刻生效（把 <code>default_qdisc</code> 应用到已有网卡；运行时改动，不改也行，重启即自动生效）</span>
+            <span data-l="en">Apply qdisc now (pushes <code>default_qdisc</code> onto already-running NICs; a runtime change, optional — a reboot does it anyway)</span>
         </dd>
 
         <dt class="key ro">8</dt>
@@ -185,6 +199,25 @@ bash /root/tcpo</code></pre>
     <p class="hint">
         <span data-l="zh">标灰的 8 / a / b 是<b>零副作用</b>的只读功能：不装包、不改配置、不重启服务，生产机可直接跑。缺 <code>ss</code>/<code>nstat</code> 之类的工具时相关指标跳过并给出手动补装命令，不会替你装。唯一的例外要你自己点头：菜单 a 里如果指定了压测对端且没装 <code>iperf3</code>，会问一次要不要装（压测会产生真实流量），答 N 就只做被动观测。</span>
         <span data-l="en">8 / a / b (greyed) are <b>side-effect free</b>: no packages installed, no config touched, no services restarted. Safe on production. If tools like <code>ss</code> or <code>nstat</code> are missing, the affected metrics are skipped and you get a manual install command — nothing is installed for you. One exception needs your explicit yes: in menu a, if you name a peer to benchmark against and <code>iperf3</code> is absent, it asks once (benchmarking generates real traffic); answer N and it stays passive-observation only.</span>
+    </p>
+    <h3>
+        <span data-l="zh">想先看看会改什么</span>
+        <span data-l="en">Want to see what it would change first</span>
+    </h3>
+    <div class="cmd">
+        <code>TCPO_DRYRUN=1 tcpo</code>
+        <button data-copy="TCPO_DRYRUN=1 tcpo">
+            <span class="idle" data-l="zh">复制</span><span class="idle" data-l="en">Copy</span>
+            <span class="done" data-l="zh">已复制</span><span class="done" data-l="en">Copied</span>
+        </button>
+    </div>
+    <p class="hint">
+        <span data-l="zh">演练模式把所有写入路径重定向到一个临时目录，整条流程照跑、一个字节都不进 <code>/etc</code>，退出时把「将写入的文件」连内容一起打印出来。<b>不需要 root</b> —— 这正是它的用处：先在自己机器上看清，再决定要不要上生产机。</span>
+        <span data-l="en">Dry-run mode redirects every write path into a temp directory: the whole flow runs, not a single byte reaches <code>/etc</code>, and on exit it prints every file it would have written, contents included. <b>No root needed</b> — that's the point: see it on your own box first, then decide whether to touch production.</span>
+    </p>
+    <p class="hint">
+        <span data-l="zh">它是靠重定向路径变量实现的，不是在每个写入函数里加判断 —— 所以写入函数一行都没改，也就不存在「某个分支忘了判断演练模式」这类漏洞：真实路径与演练路径跑的是同一份代码。改内核状态的动作（<code>sysctl --system</code>、<code>tc</code>、<code>iptables</code>、<code>modprobe</code>）另外单独跳过并打印被跳过的内容。</span>
+        <span data-l="en">It works by redirecting the path variables, not by adding a check inside each writer — so the writers are untouched, and there's no "one branch forgot to check dry-run" class of bug: the real path and the dry-run path are the same code. Actions that change kernel state (<code>sysctl --system</code>, <code>tc</code>, <code>iptables</code>, <code>modprobe</code>) are skipped separately, printing what was skipped.</span>
     </p>
 </section>
 
@@ -289,6 +322,14 @@ bash /root/tcpo</code></pre>
         <li>
             <span data-l="zh"><b>写进去不等于生效</b>：被后加载文件覆盖、内核不支持该参数、模块没加载，三种情况都静默失败。菜单 3/4 跑完会逐项比对「配置文件写的」与「<code>sysctl</code> 实际读到的」，分三类报：已生效 / 不一致（红字）/ 本内核无此参数。</span>
             <span data-l="en"><b>Written ≠ effective</b>: being overridden by a later-loaded file, an unsupported parameter, or an unloaded module all fail silently. After menus 3/4, every key written is compared against what <code>sysctl</code> actually reads back, reported in three buckets: effective / mismatched (in red) / not supported by this kernel.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>生效不等于开机还生效</b>：<code>/etc/sysctl.d/</code> 是 <code>systemd-sysctl</code> 在开机时读的，没有 systemd 就没人读它，重启后全部回到原值。菜单 2/3/4 会先探测本机开机会不会重放，不会就如实说「本次已生效、开机不会自动重放」，并生成一个开机重放脚本（<code>sysctl</code> + BBR 模块 + 网卡队列一并重放）告诉你挂到哪。<b>不自动改</b> <code>wsl.conf</code> 或 <code>rc</code> 目录——那会改变整个发行版的启动方式，超出「网络参数」范畴。WSL2 默认就不跑 systemd，是这条最常见的场合。</span>
+            <span data-l="en"><b>Effective ≠ effective after reboot</b>: <code>/etc/sysctl.d/</code> is read at boot by <code>systemd-sysctl</code>; with no systemd nobody reads it and everything reverts on restart. Menus 2/3/4 probe whether this box will replay at boot, and if not they say so plainly — "effective now, will not replay at boot" — and generate a boot replay script (<code>sysctl</code> + the BBR module + NIC queues in one) telling you where to hook it. They do <b>not</b> edit <code>wsl.conf</code> or <code>rc</code> directories for you: that changes how the whole distro boots, which is outside "network parameters". WSL2 runs without systemd by default and is where this comes up most.</span>
+        </li>
+        <li>
+            <span data-l="zh"><b>状态标记读真实生效值</b>：主菜单的 BBR 与内核参数两项是三态——<span class="ok">[已开启]</span> 是配置在且实际在跑，<span class="warn">[配置未生效]</span> 是配置文件写着但当前运行值不符（无 systemd 的机器重启后就是这个状态），<span class="bad">[未开启]</span> 是压根没配过。只看「文件存在」会把第二种报成已开启，等于告诉用户一件没发生的事。</span>
+            <span data-l="en"><b>Status reflects live values</b>: the BBR and kernel-parameter rows in the main menu are tri-state — <span class="ok">[on]</span> means configured and actually running, <span class="warn">[config not effective]</span> means the file says one thing and the running value says another (the normal state after rebooting a box without systemd), and <span class="bad">[off]</span> means never configured. Checking only "does the file exist" would report the second case as on, telling you something that didn't happen.</span>
         </li>
     </ul>
 </section>
