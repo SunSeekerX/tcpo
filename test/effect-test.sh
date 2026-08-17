@@ -64,8 +64,10 @@ self_check() {
         fi
     done
     # 顺带核对「组数」这个到处写死的数字：函数定义数、默认跑的组列表、
-    # 本文件注释、README 必须一致。判例：README 曾长期写着旧的断言项数，
-    # 与实际输出不符，让人对覆盖面产生错误印象
+    # 本文件头注释的用法说明必须一致。判例：曾长期写着旧的组数，
+    # 与实际输出不符，让人对覆盖面产生错误印象。
+    # 不再核 README——它已收窄为纯用户手册，不描述测试内部结构，
+    # 这个数字只散落在本文件内部，就地锁住即可
     local n_func n_default
     n_func=$(grep -cE '^group[0-9]+\(\)' "$0")
     n_default=$(grep -oE 'TEST_GROUPS="[^"]*"' "$0" | head -1 | grep -oE '[0-9]+' | wc -l)
@@ -73,14 +75,13 @@ self_check() {
         echo "${RED}自检失败: 定义了 $n_func 个测试组，但默认只跑 $n_default 个${NC}"
         bad_claim=1
     fi
-    local readme="$(dirname "$0")/../README.md"
-    if [ -f "$readme" ] && ! grep -q "全部 ${n_func} 组" "$readme"; then
-        echo "${RED}自检失败: README 里的组数与实际 $n_func 组不一致${NC}"
+    if ! grep -q "跑全部 ${n_func} 组" "$0"; then
+        echo "${RED}自检失败: 头注释的用法说明与实际 $n_func 组不一致${NC}"
         bad_claim=1
     fi
 
     [ "$bad_claim" = "0" ] &&
-        echo "${GREEN}自检通过: 覆盖清单、组数（$n_func 组）与 README 一致${NC}"
+        echo "${GREEN}自检通过: 覆盖清单与组数（$n_func 组）一致${NC}"
     return $bad_claim
 }
 self_check || exit 1

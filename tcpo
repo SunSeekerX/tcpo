@@ -11,110 +11,83 @@
 # [人工决策-2026-08-05 14:22:07] 只用单个整数递增，不用 semver 的三段式。
 # 判据是「不等即提示」本来就不需要大小关系，三段式反而要求维护者每次判断
 # 这算 minor 还是 patch。改动此处必须同步 VERSION 文件（Jenkins 门 4 会逐字校验）
-SCRIPT_VERSION="2"
+SCRIPT_VERSION="3"
 
 # --- 分发地址：改这一处即可（自建域名 / GitHub raw / jsDelivr）---
 # 支持环境变量覆盖，便于本地测试：TCP_DASHBOARD_URL=http://127.0.0.1:8000/tcpo bash tcpo
-# 站点由仓库根的 Jenkinsfile 发布到 tcp.itssx.com，网页与本脚本同批上线；
-# 该流水线会校验此处指向 https://tcp.itssx.com/tcpo，改动需同步 Jenkinsfile 的 SITE_URL
+# Jenkinsfile 发布到 tcp.itssx.com 并校验此处地址，改动需同步 Jenkinsfile 的 SITE_URL
 SCRIPT_URL="${TCP_DASHBOARD_URL:-https://tcp.itssx.com/tcpo}"
 
-# 版本检查的候选源，按顺序试，第一个拿到就停。自建域名在前（改完立即生效），
-# GitHub raw 兜底（自建域名挂了仍能发现新版）。
-# 只读一个小文本文件、不下载脚本本体，检查到有新版也只提示不自动更新——
-# 自动更新等于让远端代码在用户没同意的情况下改动一台生产机
+# 版本检查候选源按顺序试，第一个成功即停：自建域名优先，GitHub raw 兜底；
+# 只读文本文件、不下载脚本本体，有新版也只提示不自动更新
 VERSION_URLS="https://tcp.itssx.com/VERSION
 https://raw.githubusercontent.com/SunSeekerX/tcpo/main/VERSION"
-# 检查超时：两个源各自的上限。总耗时最坏 2×3=6 秒，且失败静默跳过不打扰用户
+# 单源超时，两源总耗时上限 6 秒，失败静默跳过
 VERSION_TIMEOUT=3
-# 检查结果缓存，避免每次开面板都联网。文件存「检查时间戳 线上版本号」
+# 检查结果缓存，避免每次开面板联网；文件存「时间戳 版本号」
 VERSION_CACHE_TTL=86400
 
-# 安装路径即命令名：文件名 tcpo 无扩展名，装到 PATH 里本身就是命令，不需要额外软链。
-# 名字取 tcp optimize。不能用 tcpd（Debian 的 tcpd 包占 /usr/sbin/tcpd、tcm 包占 /usr/bin/tcpd，
-# 装到 /usr/local/bin 会靠 PATH 优先级静默劫持系统命令），也不能用 ttcp
-# （1980 年代的经典吞吐测试工具 Test TCP，同领域撞名）。
-# tcpo 查过 Debian 全仓库无同名文件，Debian/RHEL/Alpine/Arch 四系均不冲突
+# 安装路径即命令名，装到 PATH 后本身即命令，不需要软链。名字取 tcp optimize；
+# 不能用 tcpd（Debian tcpd/tcm 包占用 /usr/sbin|bin/tcpd，会被 PATH 优先级静默劫持）
+# 或 ttcp（撞经典吞吐测试工具名）。已查过 Debian/RHEL/Alpine/Arch 四系均不冲突
 SCRIPT_PATH="/usr/local/bin/tcpo"
-# 用 zz- 前缀确保最后加载。systemd-sysctl 按文件名字典序应用、后者覆盖前者，
-# 而多数发行版/面板自带 99-sysctl.conf（字典序在 99-network-performance.conf 之后），
-# 会把这里设的值悄悄盖回去——实测判例：somaxconn 写了 65535、实际生效仍是 1024，且全程无任何报错
+# zz- 前缀确保字典序最后加载；多数发行版自带 99-sysctl.conf 排在前面会盖掉这里的值——
+# 曾实测 somaxconn 写了 65535、实际生效仍是 1024，且无任何报错
 SYSCTL_OPT="/etc/sysctl.d/zz-network-performance.conf"
 LEGACY_SYSCTL_OPT="/etc/sysctl.d/99-network-performance.conf"
 BBR_OPT="/etc/sysctl.d/10-bbr.conf"
-# tcp_bbr 的开机加载配置。集中成常量而不是散在 enable_bbr 里硬编码：
-# 它和上面几个一样是「本脚本落地的文件」，要能被回退清理、被演练重定向、走同一套写保护
+# tcp_bbr 开机加载配置，集中成常量以便回退清理、演练重定向、写保护统一处理
 BBR_MODLOAD="/etc/modules-load.d/bbr.conf"
 LIMITS_OPT="/etc/security/limits.d/99-network-performance.conf"
-# gai.conf 与它的备份。集中成常量是为了能纳入演练模式的路径重定向——
-# 之前这两个路径散落在七处硬编码，演练模式改不到它们，于是 TCPO_DRYRUN=1 跑菜单 1
-# 仍会真实改机，与「零写入」的承诺直接冲突
+# 关闭 IPv6 单独一份 drop-in：它与「网络调优」不是一回事（是关掉一整个协议族），
+# 独立文件才能单独回退，也不会让菜单 3/4 重写主配置时把它带上
+IPV6_OPT="/etc/sysctl.d/zz-disable-ipv6.conf"
+# gai.conf 与备份，集中成常量以纳入演练模式路径重定向（曾散落七处硬编码，
+# 导致 TCPO_DRYRUN=1 跑菜单 1 仍真实改机）
 GAI_CONF="/etc/gai.conf"
 GAI_BAK="/etc/gai.conf.bak"
-# 状态标记与诊断要读的是**真机**状态，不能跟着演练重定向走——否则演练模式下
-# 菜单栏显示的是临时目录里的内容，用户会误以为真机已经改了。
-# 写入路径用 $GAI_CONF（受演练重定向），只读探测用这个
+# 状态标记与诊断要读真机状态，不跟演练重定向走，否则演练模式会让用户误以为真机已改；
+# 写入用 $GAI_CONF（受重定向），只读探测用这个
 GAI_CONF_REAL="/etc/gai.conf"
-# systemd 服务的 fd 上限不走 PAM/limits.d，得靠 systemd 自己的 DefaultLimitNOFILE。
-# 写成 drop-in 而不是改主配置文件，回退时整份删掉即可
+# systemd 服务的 fd 上限走 DefaultLimitNOFILE 而非 PAM/limits.d，写成 drop-in 便于整份回退
 SYSTEMD_LIMITS_OPT="/etc/systemd/system.conf.d/zz-tcpo-limits.conf"
 
-# 状态目录：存首次运行前的原始值（供回退还原真实值而非猜的默认值）、
-# 被接管的冲突文件清单、以及 sysctl 应用日志
+# 状态目录：原始值快照（回退用）、被接管文件清单、sysctl 应用日志
 STATE_DIR="/var/lib/tcp-dashboard"
 ORIG_STATE="$STATE_DIR/original-values"
 TAKEOVER_LIST="$STATE_DIR/taken-over"
 APPLY_LOG="$STATE_DIR/apply.log"
-# 版本检查缓存：一行「检查时间戳 线上版本号」。有它才能做到「每天最多查一次」，
-# 否则每次敲 tcpo 都要等一次网络往返
+# 版本检查缓存，一行「时间戳 版本号」，实现每天最多查一次
 VERSION_CACHE="$STATE_DIR/version-check"
-# /sys 下的设置（RPS/RFS/XPS）重启即失效，用一份 plan + 一个 oneshot unit 持久化。
-# plan 与实时应用共用同一份内容，避免两边漂移
+# /sys 设置重启即失效，用 plan + oneshot unit 持久化，plan 与实时应用共用同一份内容
 NICPLAN="$STATE_DIR/nic.plan"
-# qdisc 的开机重放单独一份 plan：$NICPLAN 是「/sys 路径<TAB>值」的直接写入，
-# 而 qdisc 要跑 tc 命令并区分 mq/非 mq，格式与执行方式都不同，混在一份里会互相干扰
+# qdisc 重放单独一份 plan：格式（要跑 tc 命令、区分 mq）与 $NICPLAN 不同，混一起会互相干扰
 QDISCPLAN="$STATE_DIR/qdisc.plan"
 NIC_UNIT="/etc/systemd/system/tcp-dashboard-nic.service"
 NIC_APPLY="/usr/local/bin/tcp-dashboard-nic-apply.sh"
-# networkd-dispatcher 钩子：网卡变为 routable 时重放队列设置（补 oneshot 只在开机跑的缺口）。
-# 只在装了 systemd-networkd 的机器上有这个目录，没有就跳过
+# networkd-dispatcher 钩子：网卡变 routable 时重放队列设置，只有装了 systemd-networkd 才有此目录
 NIC_DISPATCH="/etc/networkd-dispatcher/routable.d/50-tcp-dashboard"
-# iptables 规则的所有权标记。iptables 没有 drop-in 概念，规则一旦加进链里就和别人的
-# 混在一起，comment 是唯一可靠的归属判据
+# iptables 无 drop-in 概念，comment 标记是唯一可靠的规则归属判据
 MSS_TAG="tcpo-mss-clamp"
-# RTT / 抖动的探测目标。集中成一处：探测函数与「RTT 来源」的说明文案共用同一份，
-# 否则改了目标而文案还写着旧地址
+# RTT/抖动探测目标，集中一处避免探测函数与文案分叉
 RTT_PROBE_TARGETS="1.1.1.1 8.8.8.8 9.9.9.9"
-# RFS 全局流表单独一个 drop-in：菜单 5 可以独立执行，不能依赖主配置文件已存在
+# RFS 全局流表单独一份 drop-in，使菜单 5 可独立于主配置文件执行
 NIC_SYSCTL_OPT="/etc/sysctl.d/zz-network-rfs.conf"
-# 无 systemd 环境（WSL 默认、sysvinit、容器）里 /etc/sysctl.d/ 开机没人读，
-# 写进去的参数重启即失效。给这类机器生成一个可挂到自家 init 流程的重放脚本。
-# 不自动改 wsl.conf / rc 目录：那超出「网络参数」范畴，且会改变整个发行版的启动方式
+# 无 systemd 环境开机不读 sysctl.d，生成重放脚本挂到自家 init；不自动改 wsl.conf/rc 目录
 SYSCTL_APPLY="/usr/local/bin/tcp-dashboard-sysctl-apply.sh"
-# 上面那个脚本每次运行都往这里写一行时间戳。判「它到底有没有被挂进启动链」时读它——
-# 记的是「运行时的 uptime」而不是墙钟时间：只有 uptime 很小才说明它是被 init 在开机
-# 早期自动拉起的。这比扫启动配置猜「会不会执行」可靠（后者要解析任意 shell 语义），
-# 也比只记「跑过」可靠（手工跑一次就会被误判成已挂）
+# 重放脚本每次运行记一行 uptime（非墙钟时间）：uptime 小才说明是开机早期被 init 拉起，
+# 比解析启动配置猜测更可靠，也比只记「跑过」更能防手工执行的误判
 SYSCTL_APPLY_STAMP="$STATE_DIR/sysctl-apply.stamp"
-# 「开机早期」的上限（秒）。重放脚本记录运行时的 uptime，只有小于这个值才算开机钩子。
-# 300 秒的依据：init 拉起 rc.local / openrc 服务 / WSL 的 [boot] command 通常在开机
-# 几秒内，慢机器上装完驱动挂完盘也很少超过一两分钟；而用户手工执行时机器一般已开机很久。
-# 定得太小只会漏判慢启动的机器（保守方向：多提示一句挂法），太大则可能把
-# 「开机没多久用户自己手动跑了一次」误判成钩子
+# 「开机早期」上限：init 拉起服务通常在开机几秒到一两分钟内，300 秒兼顾慢机器
 HOOK_MAX_UPTIME=300
 
 # ==================================================
 # 演练模式（TCPO_DRYRUN=1）
 # ==================================================
-# 把上面全部写入路径重定向到一个临时目录，于是整条流程照跑、一个字节都不进 /etc。
-# 这样做而不是在每个写入函数里加 if：写入函数一行都不用改，也就不存在「某个分支
-# 忘了判断 dry-run」这类漏洞——真实路径与演练路径跑的是同一份代码。
-#
-# 用途有两个：让用户零副作用地看清「两档分别会写什么」，以及在 CI 里验证生成逻辑
-# （容器里 net.core.* 多半不可写，但配置文件内容是可验的）。
-#
-# sysctl --system / tc / iptables 这些「改内核状态」的动作由 apply_sysctl 等函数
-# 各自判断 DRYRUN 跳过——它们不写文件，重定向路径管不到
+# 把全部写入路径重定向到临时目录，整条流程照跑但不进 /etc；真实路径与演练路径
+# 跑同一份代码，不用在每个写入函数里加 if，也就不存在漏判 dry-run 的分支。
+# 用途：让用户零副作用看清会写什么，也便于 CI 验证生成逻辑。
+# sysctl --system/tc/iptables 这类改内核状态的动作由各函数自行判断 DRYRUN 跳过
 DRYRUN=0
 if [ "${TCPO_DRYRUN:-0}" = "1" ]; then
     DRYRUN=1
@@ -130,9 +103,10 @@ if [ "${TCPO_DRYRUN:-0}" = "1" ]; then
     SYSCTL_OPT="$DRYRUN_ROOT$SYSCTL_OPT"
     LEGACY_SYSCTL_OPT="$DRYRUN_ROOT$LEGACY_SYSCTL_OPT"
     BBR_OPT="$DRYRUN_ROOT$BBR_OPT"
-    # 新增受管落地文件必须同步加进这份重定向清单，否则演练模式会真的写 /etc
+    # 新增受管文件必须同步加进这份重定向清单，否则演练模式会真的写 /etc
     BBR_MODLOAD="$DRYRUN_ROOT$BBR_MODLOAD"
     LIMITS_OPT="$DRYRUN_ROOT$LIMITS_OPT"
+    IPV6_OPT="$DRYRUN_ROOT$IPV6_OPT"
     GAI_CONF="$DRYRUN_ROOT$GAI_CONF"
     GAI_BAK="$DRYRUN_ROOT$GAI_BAK"
     SYSTEMD_LIMITS_OPT="$DRYRUN_ROOT$SYSTEMD_LIMITS_OPT"
@@ -151,8 +125,7 @@ if [ "${TCPO_DRYRUN:-0}" = "1" ]; then
     SYSCTL_APPLY_STAMP="$STATE_DIR/sysctl-apply.stamp"
 fi
 
-# 演练模式下把「将要执行但被跳过」的动作打出来。真实模式什么都不做（返回 1），
-# 调用方据此决定要不要真的执行
+# 演练模式下打出「将要执行但被跳过」的动作；真实模式返回 1，调用方据此决定是否真的执行
 dryrun_skip() {
     [ "$DRYRUN" = "1" ] || return 1
     echo -e "  ${CYAN}[演练]${NC} 跳过: $*"
@@ -165,7 +138,7 @@ dryrun_report() {
     local f n=0
     echo
     echo -e "${YELLOW}=========== 演练结果：将写入的文件 ===========${NC}"
-    # find 而不是逐个变量判断：这样新增写入点时不用改这里
+    # find 而不逐个变量判断，新增写入点时不用改这里
     while IFS= read -r f; do
         [ -f "$f" ] || continue
         n=$((n + 1))
@@ -182,10 +155,8 @@ EOF
     echo -e "${YELLOW}退出后可自行删除: rm -rf $DRYRUN_ROOT${NC}"
 }
 
-# 演练模式不写任何系统文件，所以不需要 root——这正是它的用处之一：
-# 在自己机器上先看清会写什么，再决定要不要上生产机。
-# 注意非 root 下 sysctl -n 读某些 key 会失败，推导出的值可能与 root 下略有差异，
-# 但配置文件的结构与推导链是一样的
+# 演练模式不写系统文件，所以不需要 root；非 root 下 sysctl -n 读某些 key 会失败，
+# 推导值可能略有差异，但配置结构与推导链一致
 if [ "$EUID" -ne 0 ] && [ "${TCPO_DRYRUN:-0}" != "1" ]; then
     echo -e "\033[0;31m错误: 必须使用 root 权限运行此脚本！\033[0m"
     echo -e "\033[1;33m提示: 只想看看会改什么？用 TCPO_DRYRUN=1 tcpo（无需 root，不写任何文件）\033[0m"
@@ -202,13 +173,9 @@ draw_line() {
     echo -e "${YELLOW}--------------------------------------------------${NC}"
 }
 
-# 校验一个「刚下载的、准备当成 tcpo 用」的文件是否真是本脚本。
-# 首次安装与菜单 7 更新共用这一份，两条路径的严格程度必须一致——
-# 首次安装反而更宽松是最糟的组合（用户第一次接触就可能装到坏内容）。
-# 判据三条，任一不过即整体放弃：
-#   1. 首行必须是 shebang —— 域名被泛解析/回落到 index.html 时拿到的是 HTML
-#   2. 必须过 bash -n —— 传输截断的文件语法必然不完整
-#   3. 必须含本脚本的特征串 —— 防止拿到的是别的 shell 脚本（比如错误页里的示例）
+# 校验下载文件是否真是本脚本，首次安装与菜单 7 更新共用同一份、严格程度一致。
+# 三条判据任一不过即放弃：首行是 shebang（防 HTML 错误页）、过 bash -n（防截断）、
+# 含本脚本特征串（防拿到别的 shell 脚本）
 validate_script() {
     local f=$1
     head -1 "$f" 2>/dev/null | grep -q '^#!/bin/bash' || {
@@ -239,8 +206,7 @@ pause_return() {
 # ==================================================
 # --- 依赖安装 ---
 # ==================================================
-# 检测包管理器。顺序有讲究：先查 apt-get（Debian 系），再 dnf（新 RHEL）后 yum（老 RHEL），
-# 因为 Fedora/RHEL9 同时有 dnf 和 yum（yum 是软链），优先用 dnf 更快
+# 顺序：apt-get → dnf → yum（Fedora/RHEL9 两者共存，yum 是软链）
 detect_pkg_mgr() {
     local pm
     for pm in apt-get dnf yum zypper pacman apk; do
@@ -249,9 +215,7 @@ detect_pkg_mgr() {
     return 1
 }
 
-# 工具名 -> 各包管理器下的包名。同一个命令在不同发行版里包名不同，
-# 而且 ss/nstat/tc 三个命令来自同一个包（iproute2 / iproute），
-# 所以按「命令名」而不是「包名」组织
+# 按命令名而非包名组织：同一命令各发行版包名不同，且 ss/nstat/tc 来自同一个包
 pkg_for() {
     local tool=$1 pm=$2
     case "$tool" in
@@ -265,8 +229,7 @@ pkg_for() {
         esac
         ;;
     tc)
-        # RHEL 系把 tc 拆成了独立包 iproute-tc，装 iproute 拿不到它。
-        # 实测 Fedora 41 / Rocky 9 / Alma 9 都是这样
+        # RHEL 系把 tc 拆成独立包 iproute-tc，装 iproute 拿不到它（实测 Fedora41/Rocky9/Alma9）
         case "$pm" in
         apt-get) echo iproute2 ;;
         dnf | yum) echo iproute-tc ;;
@@ -277,12 +240,8 @@ pkg_for() {
         ;;
     ethtool) echo ethtool ;;
     iptables)
-        # 全系都写 iptables 就够。RHEL 9+ 起没有名为 iptables 的包了
-        # （dnf info iptables 报 No matching Packages），但 iptables-nft
-        # 声明了 Provides: iptables，所以 dnf install iptables 照样能装上。
-        # 实测 Rocky 8 装到 iptables、Rocky 9 装到 iptables-nft，都拿到可用的
-        # /usr/sbin/iptables。判包名是否存在要用 provides 而不是 info——
-        # 用 info 会把这种虚拟包误判成「映射错了」
+        # 全系写 iptables 即可：RHEL9+ 无 iptables 包但 iptables-nft 声明 Provides: iptables，
+        # dnf install iptables 照样能装上（判包名存在要用 provides，用 info 会误判映射错误）
         echo iptables
         ;;
     ping)
@@ -304,19 +263,25 @@ pkg_for() {
         esac
         ;;
     iperf3) echo iperf3 ;;
+    sysctl)
+        # RHEL 系最小化镜像（实测 rockylinux:9）不自带 sysctl，procps-ng 提供它。
+        # 判例：缺它时 `sysctl -n` 全部失败，本脚本把每个 key 都记成 ABSENT——
+        # 快照全空、生效校验全报读不到、菜单 i 的状态判定恒假（关不掉也恢复不了）。
+        # Alpine 的 sysctl 来自 busybox（已内置），仍给出 procps 映射作兜底
+        case "$pm" in
+        apt-get) echo procps ;;
+        dnf | yum) echo procps-ng ;;
+        zypper) echo procps ;;
+        pacman) echo procps-ng ;;
+        apk) echo procps ;;
+        esac
+        ;;
     *) echo "$tool" ;;
     esac
 }
 
-# apt 索引是否已经可用且够新。只在本进程内记标记不够：面板的每个菜单是同一进程内调用，
-# 但用户可能反复进出脚本（每次都是新进程），那样每次装包都要等 apt-get update
-# 跑完（Ubuntu 上 30-60 秒）。
-#
-# 判据必须是「索引文件本身真实存在且够新」，不能用 /var/lib/apt/lists/lock 的时间：
-# lock 会在任何 apt 操作时被创建或 touch——包括一次失败的 update、apt-get install、
-# 甚至 apt-cache——此后 24 小时内都会被误判成「索引新鲜」，于是跳过 update
-# 直接装包，得到 "E: Unable to locate package"，本来能自动补齐的依赖被错误降级。
-# update-success-stamp 是 apt 自己维护的「成功」时间戳，可信；lists/lock 不可信。
+# apt 索引是否够新，需跨进程持久（用户可能反复进出脚本）。判据用 update-success-stamp
+# 或实际索引文件，不用 lists/lock（lock 被任何 apt 操作 touch，会误判为新鲜致装包报 Unable to locate package）
 apt_index_fresh() {
     local stamp age
     # apt 的 periodic 成功戳（unattended-upgrades 装了才有），存在就直接采信
@@ -331,17 +296,12 @@ apt_index_fresh() {
 }
 
 APT_UPDATED=0
-# 所有装包动作都套超时：软件源不可达时 apt/dnf 会挂很久（实测某些环境下
-# apt-get update 卡满 10 分钟仍拉不到索引），没有超时的话用户只看到面板卡死、
-# 不知道在等什么，也没法中断
+# 装包套超时：软件源不可达时 apt/dnf 会挂很久（实测卡满 10 分钟拉不到索引），无超时用户没法中断
 PKG_TIMEOUT=180
-# 装包日志。输出不直接打印（apt/dnf 几百行会刷屏），但必须留下来供排查——
-# 出问题时「装不上」三个字没有任何用，得能看到源返回了什么
+# 装包日志：输出不直接打印（几百行刷屏），但留档供排查
 PKG_LOG="$STATE_DIR/pkg.log"
 
-# 后台跑装包命令，前台显示转轮 + 已用秒数。
-# 装包在慢源上要几十秒，全静默会让用户以为卡死了（实测反馈）。
-# 无 tty 时（CI/管道）退化为静默，不往日志里刷转轮字符
+# 后台跑装包命令，前台显示转轮+已用秒数（全静默会让用户以为卡死）；无 tty 时退化为静默
 run_pkg() {
     local rc pid spin='-\|/' i=0 elapsed=0
     mkdir -p "$STATE_DIR" 2>/dev/null
@@ -379,7 +339,7 @@ pkg_install() {
     local pm=$1 pkg=$2
     case "$pm" in
     apt-get)
-        # 变量前缀对 shell 函数不起作用（只对外部命令有效），必须 export
+        # 变量前缀对 shell 函数不起作用，必须 export
         export DEBIAN_FRONTEND=noninteractive
         if [ "$APT_UPDATED" = "0" ] && ! apt_index_fresh; then
             echo -e "  ${YELLOW}  先更新 apt 索引（首次较慢，最多等 ${PKG_TIMEOUT}s）${NC}" >&2
@@ -388,8 +348,7 @@ pkg_install() {
             APT_UPDATED=1
         fi
         run_pkg apt-get install -y -qq "$pkg" && return 0
-        # 装失败且这次还没 update 过：判据可能误判了索引新鲜度（比如索引虽在但已过期、
-        # 或源列表变过），补一次 update 再试。这样任何判据误差都不会让依赖被错误降级
+        # 装失败且未 update 过：可能误判了索引新鲜度，补一次再试，防止误判导致依赖降级
         if [ "$APT_UPDATED" = "0" ]; then
             echo -e "  ${YELLOW}$pkg 装不上，补一次 apt 索引更新后重试 ...${NC}" >&2
             run_pkg apt-get update -qq
@@ -402,7 +361,7 @@ pkg_install() {
     yum) run_pkg yum install -y -q "$pkg" ;;
     zypper) run_pkg zypper --non-interactive --quiet install -y "$pkg" ;;
     pacman)
-        # 先试不同步（-S），失败再同步（-Sy）。避免每装一个包都拉一遍数据库
+        # 先试不同步（-S），失败再同步（-Sy），避免每装一包都拉一遍数据库
         run_pkg pacman -S --noconfirm --needed --quiet "$pkg" ||
             run_pkg pacman -Sy --noconfirm --needed --quiet "$pkg"
         ;;
@@ -411,10 +370,8 @@ pkg_install() {
     esac
 }
 
-# 确保若干命令可用，缺的自动装。返回仍然缺失的命令列表（空则全部就绪）。
-# 用法: missing=$(ensure_tools ss nstat tc)
-# 只装、不报错退出——装不上就降级，由调用方决定怎么提示。
-# 这是有意的：调优面板不该因为装不上一个诊断工具就拒绝干活
+# 确保若干命令可用，缺的自动装，返回仍缺失的命令列表。用法: missing=$(ensure_tools ss nstat tc)
+# 装不上只降级不报错退出，调优面板不该因一个诊断工具装不上就拒绝干活
 ensure_tools() {
     local want=("$@") missing=() need_install=() t pm pkg
     for t in "${want[@]}"; do
@@ -427,7 +384,7 @@ ensure_tools() {
         return 1
     }
 
-    echo -e "  ${YELLOW}缺少 ${need_install[*]}，正在用 $pm 安装 ...${NC}" >&2
+    echo -e "  ${YELLOW}缺少 ${need_install[*]}，正在安装 ...${NC}" >&2
     # 先把包名去重（ss/nstat/tc 都来自 iproute2，只需装一次）
     local pkgs="" seen
     for t in "${need_install[@]}"; do
@@ -435,17 +392,13 @@ ensure_tools() {
         case " $pkgs " in *" $pkg "*) continue ;; esac
         pkgs="$pkgs $pkg"
     done
-    # 逐包报进度：一次可能装好几个包（ethtool + iproute2 + iputils-ping），
-    # 只说「正在安装」的话用户看不出卡在哪一个上
     local total done_n=0
     total=$(printf '%s\n' $pkgs | wc -l | tr -d ' ')
     for pkg in $pkgs; do
         done_n=$((done_n + 1))
-        echo -e "  ${YELLOW}[$done_n/$total] $pkg ...${NC}" >&2
-        if pkg_install "$pm" "$pkg"; then
-            echo -e "  ${GREEN}[$done_n/$total] $pkg 完成${NC}" >&2
-        else
-            echo -e "  ${YELLOW}[$done_n/$total] $pkg 安装失败（源不可达、超时或包名不符），详见 $PKG_LOG${NC}" >&2
+        [ "$total" -gt 1 ] && echo -e "  ${YELLOW}[$done_n/$total] $pkg ...${NC}" >&2
+        if ! pkg_install "$pm" "$pkg"; then
+            echo -e "  ${YELLOW}$pkg 安装失败，详见 $PKG_LOG${NC}" >&2
         fi
     done
 
@@ -454,7 +407,7 @@ ensure_tools() {
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "  ${YELLOW}仍缺 ${missing[*]}，相关功能会降级。手动补装:${NC}" >&2
+        echo -e "  ${YELLOW}仍缺 ${missing[*]}，相关功能降级${NC}" >&2
         local hint=""
         for t in "${missing[@]}"; do
             pkg=$(pkg_for "$t" "$pm")
@@ -462,11 +415,11 @@ ensure_tools() {
             hint="$hint $pkg"
         done
         case "$pm" in
-        apt-get) echo -e "  ${YELLOW}    apt install -y$hint${NC}" >&2 ;;
-        dnf | yum) echo -e "  ${YELLOW}    $pm install -y$hint${NC}" >&2 ;;
-        zypper) echo -e "  ${YELLOW}    zypper install -y$hint${NC}" >&2 ;;
-        pacman) echo -e "  ${YELLOW}    pacman -S$hint${NC}" >&2 ;;
-        apk) echo -e "  ${YELLOW}    apk add$hint${NC}" >&2 ;;
+        apt-get) echo -e "  ${YELLOW}手动装: apt install -y$hint${NC}" >&2 ;;
+        dnf | yum) echo -e "  ${YELLOW}手动装: $pm install -y$hint${NC}" >&2 ;;
+        zypper) echo -e "  ${YELLOW}手动装: zypper install -y$hint${NC}" >&2 ;;
+        pacman) echo -e "  ${YELLOW}手动装: pacman -S$hint${NC}" >&2 ;;
+        apk) echo -e "  ${YELLOW}手动装: apk add$hint${NC}" >&2 ;;
         esac
         printf '%s\n' "${missing[@]}"
         return 1
@@ -474,11 +427,8 @@ ensure_tools() {
     return 0
 }
 
-# 只读功能（菜单 8/a/b）用这个，不用 ensure_tools。
-# 差别是它绝不装包：只检测、报告缺什么、给出手动补装命令。
-# 理由是这三个菜单对外承诺「零副作用、生产机可直接跑」，而装包会刷新包索引、
-# 改 dpkg/rpm 数据库、往系统里装新二进制——在别人的生产机上那不算零副作用。
-# 缺工具时相关指标降级（由调用方各自处理缺失），不阻止其余项继续跑。
+# 只读功能（菜单 8/a/b）专用，绝不装包，只检测报告缺什么并给手动补装命令——
+# 这三个菜单对外承诺零副作用，而装包会刷新索引、改 dpkg/rpm 数据库，不算零副作用。
 # 返回 0 = 全部就绪，1 = 有缺失
 require_tools_readonly() {
     local want=("$@") missing=() t pm pkg hint=""
@@ -505,9 +455,8 @@ require_tools_readonly() {
     return 1
 }
 
-# 确保 /etc/sysctl.d 存在。RHEL / Rocky / AlmaLinux / Fedora 的最小化安装里这个目录
-# 可能不存在（Debian 系自带，容易掩盖这个问题），直接 cat > 会报 No such file or directory
-# 并让整个调优静默失败——实测判例：Rocky 9 容器里菜单 3 全程无配置写入
+# RHEL 系最小化安装可能没有 /etc/sysctl.d（Debian 系自带易掩盖此问题），
+# 直接 cat > 会静默失败——曾实测 Rocky 9 容器里菜单 3 全程无配置写入
 ensure_sysctl_dir() {
     [ -d /etc/sysctl.d ] && return 0
     mkdir -p /etc/sysctl.d 2>/dev/null && return 0
@@ -515,36 +464,96 @@ ensure_sysctl_dir() {
     return 1
 }
 
-# sysctl --system 的报错不能丢：内核拒绝某个值、参数不存在、被后加载文件覆盖，
-# 三种情况的提示都在这里。之前统一 &>/dev/null 导致排查时拿不到内核给的原因
+# busybox 的 sysctl 不认 --system（只有 -p <文件>）。
+# [人工决策-2026-08-16 16:50:51] 判例（alpine:3.21 实测）：busybox sysctl 遇到
+# --system 会打印 "unrecognized option" + 自己的帮助文本，参数一个都不应用，
+# 而 apply_sysctl 的报错过滤只捞到帮助文本里的字样、判不出失败，于是一路报「已生效」。
+# 后果不限于本次新增的 IPv6：菜单 2/3/4 在 Alpine 上写的参数从来就没被应用过。
+# 过去没暴露是因为 distro-test 只断言配置文件内容、不查运行时值（容器里 net.core.* 本就读不到），
+# 本轮新增的 IPv6 运行时断言是第一条真查生效值的。
+# 判据用 `sysctl --help` 里有没有 system 字样：直接跑 --system 试探会真的改机器
+sysctl_supports_system() {
+    sysctl --help 2>&1 | grep -q -- '--system'
+}
+
+# 逐个应用 sysctl.d 下的配置文件，供不支持 --system 的 busybox 用。
+# 顺序必须与 sysctl.d(5) 一致：所有目录的文件按文件名字典序排序、同名的 /etc 优先，
+# 否则本脚本的 zz- 前缀就赢不到「最后加载」这件事（那是它整个设计的前提）
+apply_sysctl_files() {
+    local d f base seen="" list=""
+    # 先按 basename 收集去重（同名文件 /etc 优先，与 systemd-sysctl 的覆盖规则一致）
+    for d in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*.conf; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            case " $seen " in *" $base "*) continue ;; esac
+            seen="$seen $base"
+            list="$list$base $f
+"
+        done
+    done
+    # 按 basename 排序后逐个 -p；/etc/sysctl.conf 最后应用（sysctl.d(5) 的规定）
+    printf '%s' "$list" | sort | while read -r base f; do
+        [ -n "$f" ] || continue
+        echo "* Applying $f ..."
+        sysctl -p "$f" 2>&1
+    done
+    [ -f /etc/sysctl.conf ] && {
+        echo "* Applying /etc/sysctl.conf ..."
+        sysctl -p /etc/sysctl.conf 2>&1
+    }
+    return 0
+}
+
+# sysctl --system 的报错不能丢，此前统一 &>/dev/null 导致排查拿不到内核给的原因
 apply_sysctl() {
     mkdir -p "$STATE_DIR"
-    # 只跑一次并复用输出：跑两遍（一次写日志一次抓报错）既浪费又可能两次结果不一致
-    local out errs
+    # 只跑一次并复用输出，避免两次结果不一致
+    local out errs mode
     dryrun_skip "sysctl --system（应用内核参数）" && return 0
-    out=$(sysctl --system 2>&1)
+    # [人工决策-2026-08-16 22:31:43] 缺 sysctl 命令时必须明确失败，不能继续。
+    # 旧写法直接跑 `sysctl --system`，shell 报 "command not found" 但退出码/输出
+    # 对不上后面的报错过滤（只 grep cannot|error|...），于是 apply 与回退都当成功，
+    # 运行时值一项都没动。菜单 6 也会一路打出「回退完成」
+    if ! command -v sysctl >/dev/null 2>&1; then
+        ensure_tools sysctl >/dev/null
+        if ! command -v sysctl >/dev/null 2>&1; then
+            echo -e "  ${RED}缺 sysctl 命令且自动安装失败，无法应用/还原内核参数${NC}" >&2
+            echo -e "  ${YELLOW}手动补装后重试（包名: procps-ng / procps）${NC}" >&2
+            {
+                echo "===== $(date '+%F %T') sysctl 不可用 ====="
+                echo "command not found: sysctl"
+            } >>"$APPLY_LOG"
+            return 1
+        fi
+    fi
+    if sysctl_supports_system; then
+        mode="sysctl --system"
+        out=$(sysctl --system 2>&1)
+    else
+        # busybox：逐文件 -p，顺序与 sysctl.d(5) 一致
+        mode="sysctl -p 逐文件（本机 sysctl 不支持 --system）"
+        out=$(apply_sysctl_files)
+    fi
     {
-        echo "===== $(date '+%F %T') sysctl --system ====="
+        echo "===== $(date '+%F %T') $mode ====="
         printf '%s\n' "$out"
     } >>"$APPLY_LOG"
     # 只把真正的报错回显给用户（正常输出是一堆 "* Applying /etc/sysctl.d/xx.conf ..."）
-    errs=$(printf '%s\n' "$out" | grep -iE 'cannot|error|unknown|invalid|permission' | head -8)
+    # 覆盖 command not found / No such file / unrecognized option（busybox）等
+    errs=$(printf '%s\n' "$out" |
+        grep -iE 'cannot|error|unknown|invalid|permission|not found|No such|unrecognized' |
+        head -8)
     [ -z "$errs" ] && return 0
 
-    # sysctl --system 应用系统里的全部 conf，报错可能压根不来自本脚本。
-    # 典型判例：systemd 自带的 /usr/lib/sysctl.d/50-default.conf 用
-    # net.ipv4.conf.*.accept_source_route 通配，展开后命中伪接口 all 被内核拒绝，
-    # 任何一次 sysctl --system 都会打印它。把这类无条件报成「sysctl 报错」，
-    # 会让用户以为本次调优失败了（实测反馈）。
-    # 判据：报错行里的 key 是否属于本脚本受管的 MANAGED_KEYS
+    # sysctl --system 应用系统全部 conf，报错可能不来自本脚本（如 systemd 自带的
+    # 50-default.conf 通配 accept_source_route 命中伪接口 all 被拒，每次都会打印）。
+    # 判据：报错行的 key 是否属于本脚本受管的 MANAGED_KEYS
     local ours="" theirs="" line key
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        # sysctl 的报错有三种格式，都要认（只认第一种会把后两种误判成「别人的」）：
-        #   sysctl: setting key "net.core.somaxconn": Invalid argument
-        #   sysctl: permission denied on key "net.core.netdev_budget"
-        #   sysctl: cannot stat /proc/sys/net/ipv4/tcp_fastopen: No such file...
-        # 第三种是路径形式，转成点号 key 再比对
+        # sysctl 报错有三种格式都要认，第三种是路径形式，转点号 key 再比对
         key=$(printf '%s\n' "$line" | sed -n 's/.*key "\([^"]*\)".*/\1/p')
         if [ -z "$key" ]; then
             key=$(printf '%s\n' "$line" |
@@ -566,7 +575,6 @@ EOF
         printf '%s' "$ours"
     fi
     if [ -n "$theirs" ]; then
-        # 措辞明确说清「不是本次调优的问题」，否则用户没法判断要不要管
         echo -e "${YELLOW}  以下报错来自系统里其他 sysctl 配置文件，与本次调优无关（详见 $APPLY_LOG）:${NC}"
         printf '%s' "$theirs"
     fi
@@ -576,51 +584,44 @@ EOF
 # ==================================================
 # --- 环境探测：决定「写进 /etc/sysctl.d 之后开机还会不会生效」---
 # ==================================================
-# 这一组判据只回答一个问题：本机开机时有没有人去读 /etc/sysctl.d/。
-# 有 systemd 就有 systemd-sysctl，没有则配置文件躺着没人管、重启即回原值。
+# 判据：本机开机时有没有人读 /etc/sysctl.d/；有 systemd 才有 systemd-sysctl
 # [人工决策-2026-08-05 14:22:07] 加这一层的起因是实测判例：WSL2 默认不跑 systemd，
 # 面板跑完参数确实生效，wsl --shutdown 后全部回到原值，而主菜单始终显示「已开启」、
 # 菜单 3 还打印「配置持久化于 xxx」——用户以为早就调好了，实际每次重启都白调。
 # 菜单 5 的网卡队列本来就查 has_systemd 并如实降级，sysctl 这条路径漏了同样的判断。
 # 规则：凡宣布「持久化」前必须先探测本机开机会不会重放，禁止无条件打印
 
-# 容器判据。原先内联在 verify_sysctl_applied 里，现在两处都要用，提出来
+# 容器判据，原内联在 verify_sysctl_applied 里，现两处都要用故提出来
 is_container() {
     [ -f /.dockerenv ] && return 0
     grep -qaE 'docker|containerd|lxc' /proc/1/cgroup 2>/dev/null
 }
 
-# WSL 判据。必须在 is_container 之后判：Docker Desktop 的容器跑在 WSL2 内核上，
-# /proc/version 同样含 microsoft，只看这一条会把普通容器误判成 WSL
+# 必须在 is_container 之后判：Docker Desktop 容器跑在 WSL2 内核上，/proc/version
+# 同样含 microsoft，只看这一条会把普通容器误判成 WSL
 is_wsl() {
     [ -e /proc/sys/fs/binfmt_misc/WSLInterop ] && return 0
     [ -d /run/WSL ] && return 0
     grep -qi microsoft /proc/version 2>/dev/null
 }
 
-# 系统是否真的由 systemd 管。容器、以及 sysvinit/openrc 的机器上装 unit 是无效动作，
-# 不能装完就宣布「已持久化」
+# 容器与 sysvinit/openrc 机器上装 unit 是无效动作，不能装完就宣布已持久化
 has_systemd() {
     command -v systemctl >/dev/null 2>&1 || return 1
     [ -d /run/systemd/system ] || return 1
     return 0
 }
 
-# WSL 的 /etc/wsl.conf 里已配置的 [boot] command（没有则空串）。
-# 只取第一条：WSL 只认一个 command=，写两行不会都执行
+# /etc/wsl.conf 里已配置的 [boot] command（没有则空串），只取第一条（WSL 只认一个）
 wsl_boot_command() {
     [ -f /etc/wsl.conf ] || return 0
     sed -n 's/^[[:space:]]*command[[:space:]]*=[[:space:]]*//p' /etc/wsl.conf | head -1
 }
 
-# 开机会不会重放 sysctl 配置。返回 0 表示会，非 0 表示写了也留不住。
-# 判据按环境分开，不能只看某一条：
-#   - WSL 必须先判（它的 /etc/rcS.d/S01procps 链接是发行版自带的，但 WSL 的 /init
-#     不是 sysvinit，那个链接压根不会被执行，只看 rc 链接会误报「能持久化」）
-#   - 容器由宿主决定，脚本管不了
-# 本脚本生成的重放脚本有没有被挂进启动链。
-# 与「开机会不会应用 sysctl.d」是两件不同的事，必须分开判——混成一件会得出
-# 「procps 会跑 sysctl，所以我们的脚本在重放」这种错误结论（判例见 sysctl_replay_ok）
+# 开机会不会重放 sysctl 配置，返回 0 表示会。判据按环境分开：WSL 必须先判
+# （/etc/rcS.d/S01procps 链接在 WSL 的 /init 下不会被执行，只看 rc 链接会误报能持久化），
+# 容器由宿主决定脚本管不了。与「本脚本重放脚本是否已挂进启动链」是两件事，必须分开判
+# （判例见 sysctl_replay_ok）
 # [人工决策-2026-08-05 21:29:17] 不再宣称「已挂进启动链」这个事实——它无法被可靠判定，
 # 六轮尝试全部被推翻，两条路各有不可消除的缺陷：
 #   A) 扫启动配置 grep 脚本名：静态判断任意 shell 会不会执行某脚本要解析 shell 语义，
@@ -641,9 +642,7 @@ sysctl_apply_stamp_up() {
     case "${u:-x}" in '' | *[!0-9]*) echo "?" ;; *) echo "$u" ;; esac
 }
 
-# 本次开机的标识。boot_id 每次开机由内核重新生成，四类环境（WSL / Debian / Alpine /
-# RHEL 容器）实测都可读。有它才能把「本次开机的记录」与「上次开机的」区分开，
-# 而不必靠 uptime 大小去猜。
+# 本次开机的标识，用于把「本次开机记录」与「上次的」区分开，不必靠 uptime 大小去猜。
 # [人工决策-2026-08-06 01:05:22] 替代标识必须是「重启后必然变化」的东西，
 # 不能是任何基于时间的近似。两版被推翻的写法：
 #   1) 比 uptime 大小：分不清开机——上次留下 uptime 5，本次开机 120 秒钩子还没跑，
@@ -722,46 +721,30 @@ sysctl_apply_ran_at_boot() {
     [ "$rec_up" -le "$HOOK_MAX_UPTIME" ]
 }
 
-# 两个开机标识是否指同一次开机。两种形式（id: 的 boot_id、tok: 的 tmpfs token）
-# 都是「重启后必然变化」的精确值，所以一律要求逐字相等——不再有任何宽容窗口。
-# 形式不同视为不同：那说明判据来源变了（比如内核换了、tmpfs 挂载变了），无从比较
+# 逐字相等才算同一次开机，不留宽容窗口
 boot_ident_same() {
     [ -n "$1" ] && [ "$1" = "$2" ]
 }
 
-# 开机会不会重新应用 /etc/sysctl.d/*.conf。
-# 注意它只管 sysctl 这一件事：BBR 是模块时还要有人 modprobe（/etc/modules-load.d
-# 只有 systemd 读），所以调用方不能拿它当「BBR 也会恢复」的依据
+# 开机会不会重新应用 /etc/sysctl.d/*.conf。只管 sysctl，不代表 BBR 模块也会加载
 sysctl_replay_ok() {
     has_systemd && return 0
-    # 容器的持久化由宿主决定，脚本管不了
     is_container && return 1
-    # 我们自己的重放脚本在本次开机早期运行过 —— 它内部就是 modprobe + sysctl --system。
-    # 这只是「看起来挂好了」的迹象，不是确证（配置可能在那之后被删），
-    # 所以调用方的措辞必须留有余地，不能说成「已持久化」
+    # 重放脚本有运行痕迹（迹象，非确证）
     sysctl_apply_ran_at_boot && return 0
-    if is_wsl; then
-        # WSL 的 /init 不是 sysvinit：发行版自带的 rc 链接压根不会被执行，
-        # 所以除了上面那条（用户挂了我们的脚本）之外一律判「不会重放」
-        return 1
-    fi
-    # sysvinit：Debian 系 procps 包的 rcS 链接会跑 sysctl --system
+    # WSL 的 /init 不是 sysvinit，rc 链接不会被执行
+    if is_wsl; then return 1; fi
+    # sysvinit：procps 的 rcS 链接
     [ -x /etc/init.d/procps ] && ls /etc/rc[S2].d/S*procps >/dev/null 2>&1 && return 0
-    # openrc（Alpine / Gentoo）：sysctl 服务加入 boot runlevel 后会应用 /etc/sysctl.d/*.conf。
-    # 判据是 runlevel 链接真的存在，不是「服务脚本存在」——脚本是包自带的，
-    # 没 rc-update add 就不会跑（Alpine 默认不 add，实测 /etc/runlevels/boot 是空的）
+    # openrc：判据是 runlevel 链接存在（Alpine 默认不 add）
     [ -e /etc/runlevels/boot/sysctl ] || [ -e /etc/runlevels/sysinit/sysctl ] ||
         [ -e /etc/runlevels/default/sysctl ]
 }
 
-# 开机会不会加载 tcp_bbr 模块。与 sysctl 分开判：
-# /etc/modules-load.d 只有 systemd 读，无 systemd 机器上光靠 sysctl 重放不够——
-# 模块没加载时内核会直接拒绝 tcp_congestion_control=bbr，重启后静默回到 cubic。
-# 判例：sysvinit 机器上 procps 会重放 sysctl，据此报「已持久化」，但 BBR 实际没恢复
+# 开机会不会加载 tcp_bbr 模块。与 sysctl 分开判：模块没加载时内核直接拒绝 bbr
+# 判例：sysvinit 上 procps 重放 sysctl 但 BBR 实际没恢复
 bbr_reload_ok() {
-    # 内建（非模块）时不需要任何人加载。判据是 tcp_bbr 出现在 modules.builtin，
-    # 不能用「/sys/module/tcp_bbr 存在但没有 initstate」——那个目录在模块已加载时
-    # 同样存在，且部分内核对内建项也给 initstate，两种情况分不开
+    # 内建时不需要加载，判据是 modules.builtin
     grep -qE '(^|/)tcp_bbr\.ko' "/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null && return 0
     # [人工决策-2026-08-05 16:58:33] 判据必须是「开机时谁会加载它」，不是
     # 「现在可用列表里有没有 bbr」。available 含 bbr 只说明本次会话里模块已加载
@@ -769,13 +752,9 @@ bbr_reload_ok() {
     # 旧写法在「模块已临时加载 + 没有任何持久化配置」时报「开机可恢复」，
     # 而重启后无人加载、静默回到 cubic——正是本函数要防的那个假报
     if has_systemd; then
-        # systemd 读 /etc/modules-load.d/*.conf 与 /etc/modules（后者由 kmod 的
-        # systemd-modules-load 兼容读取）。必须确认文件真的在且内容对：
-        # 写入可能失败（只读 /etc、磁盘满），也可能被用户或别的工具删掉
         modules_load_has_bbr && return 0
         return 1
     fi
-    # 无 systemd：/etc/modules 里写着就是确证（Debian 系 kmod 会读它）
     grep -qE '^[[:space:]]*tcp_bbr[[:space:]]*$' /etc/modules 2>/dev/null && return 0
     # [人工决策-2026-08-05 22:14:33] 重放脚本在本次开机早期跑过也要算进来（返回 2）。
     # 上一轮把它排除是错的：那个脚本开机时会先 modprobe tcp_bbr 再 sysctl --system，
@@ -788,10 +767,7 @@ bbr_reload_ok() {
     return 1
 }
 
-# /etc/modules-load.d/*.conf 或 /etc/modules 里是否真的写着 tcp_bbr。
-# 单独成函数是因为「写了没有」与「写成功了没有」要在两处用：enable_bbr 落盘后要验，
-# bbr_reload_ok 判开机能否恢复时也要验。只看我们自己那个文件不够——
-# 用户可能把它写在别的 .conf 里，那也算有效
+# modules-load.d 里是否写着 tcp_bbr（enable_bbr 落盘后验证 + bbr_reload_ok 判开机恢复共用）
 modules_load_has_bbr() {
     local f
     # [人工决策-2026-08-05 18:31:44] 只查 *.conf，不能对整个目录递归 grep：
@@ -815,8 +791,7 @@ modules_load_has_bbr() {
         [ -f "$f" ] || continue
         grep -qE '^[[:space:]]*tcp_bbr[[:space:]]*$' "$f" 2>/dev/null && return 0
     done
-    # /etc/modules 是 Debian 系 kmod 的清单（systemd 的 systemd-modules-load 也会读），
-    # 它是单个文件、没有扩展名约定，直接查
+    # /etc/modules 是 Debian 系 kmod 的清单，systemd-modules-load 也会读
     grep -qE '^[[:space:]]*tcp_bbr[[:space:]]*$' /etc/modules 2>/dev/null
 }
 
@@ -829,12 +804,6 @@ modules_load_has_bbr() {
 #     范畴，也不再是「文件级可完整回退」——与项目边界冲突
 # 所以只把东西备好、挂哪由用户决定。这是本项目「不越界」与「别让用户自己踩坑」的折中
 write_sysctl_apply() {
-    # 重定向失败（目标只读 / 磁盘满 / 目录不存在）的报错由 shell 打印到 stderr、
-    # 退出码却容易被忽略。必须包住整个复合命令才吞得掉那行裸报错，并自己给归属明确的提示，
-    # 否则用户只看到一行 "cannot create" 不知道是谁在写什么
-    # 必须先查链接：这里写的是一个 root 执行的可执行脚本，跟着链接写出去等于
-    # 让本脚本以 root 覆盖任意文件。已复现：把 $SYSCTL_APPLY 预先链到别处，
-    # 目标文件会被整份改成启动脚本内容而函数仍返回 0。
     # [人工决策-2026-08-05 16:22:41] 这是安全问题而非假成功提示，优先级高于其余写入点
     refuse_if_symlink "$SYSCTL_APPLY" || return 1
     if ! { cat >"$SYSCTL_APPLY" <<APPLYEOF
@@ -853,8 +822,36 @@ for _c in $BBR_OPT $SYSCTL_OPT; do
 done
 # 这里不经 apply_sysctl（面板里的 sysctl --system 一律走那个入口以便回显内核报错）：
 # 本脚本在开机时跑、没有终端可回显，且是独立文件调不到面板的函数。
-# 输出落日志供事后排查，别丢掉
-sysctl --system >>$APPLY_LOG 2>&1
+# 输出落日志供事后排查，别丢掉。
+# [人工决策-2026-08-16 16:50:51] busybox 的 sysctl 不认 --system（alpine 实测）：
+# 它打印 unrecognized option + 帮助文本、参数一个都不应用，退出码仍是 0。
+# 开机重放脚本不能假设宿主是 util-linux/procps 的 sysctl，必须自带降级路径——
+# 与面板侧 apply_sysctl 的判据一致，但这里是独立文件，把两条路径都写进去
+if sysctl --help 2>&1 | grep -q -- '--system'; then
+    sysctl --system >>$APPLY_LOG 2>&1
+else
+    {
+        _seen=""
+        for _d in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+            [ -d "\$_d" ] || continue
+            for _f in "\$_d"/*.conf; do
+                [ -f "\$_f" ] || continue
+                _b=\$(basename "\$_f")
+                case " \$_seen " in *" \$_b "*) continue ;; esac
+                _seen="\$_seen \$_b"
+                echo "\$_b \$_f"
+            done
+        done
+    } | sort | while read -r _b _f; do
+        [ -n "\$_f" ] || continue
+        echo "* Applying \$_f ..."
+        sysctl -p "\$_f" 2>&1
+    done >>$APPLY_LOG 2>&1
+    [ -f /etc/sysctl.conf ] && {
+        echo "* Applying /etc/sysctl.conf ..."
+        sysctl -p /etc/sysctl.conf 2>&1
+    } >>$APPLY_LOG 2>&1
+fi
 # 菜单 5 的 /sys 队列设置（RPS/RFS/XPS）也一并重放，省得再挂第二个钩子
 [ -x $NIC_APPLY ] && $NIC_APPLY
 # 记录「本次开机 + 该 boot 内最早一次运行的 uptime」。面板据此判断本脚本是否被挂进
@@ -948,78 +945,35 @@ wsl_boot_hint_verify() {
     if is_wsl; then
         local cur
         cur=$(wsl_boot_command)
-        # 只把 wsl.conf 里那行**原样打出来**让用户自己看，不替他判断里面有没有。
-        # wsl.conf 是结构化配置（不是任意 shell），把原文摊开是有意义的信息；
-        # 但那行到底会不会执行本脚本仍要用户自己认（`command=/bin/echo xxx.sh` 就不会）
         if [ -n "$cur" ]; then
-            echo -e "  ${CYAN}参考: /etc/wsl.conf 的 [boot] command 现在是${NC}"
-            echo -e "        command=$cur"
-        else
-            echo -e "  ${YELLOW}参考: /etc/wsl.conf 里当前没有 [boot] command${NC}"
+            echo -e "  ${CYAN}当前 [boot] command=$cur${NC}"
         fi
     fi
-    # [人工决策-2026-08-05 22:14:33] 不给 grep 启动目录那条命令：面板自己已经因为
-    # 「文本匹配不可靠」放弃了那个判据（注释、示例字符串、备份文件都会命中，
-    # 换个挂法又会漏），把同一套不可靠判据当作「自己核实的办法」推给用户，
-    # 只是把误导转移了一层。
-    # 改为给一条真正能验的办法：重启后回来看这台机器的参数还在不在——
-    # 那是「开机会不会自动重放」的定义本身，不需要任何推测
-    echo -e "  ${CYAN}核实办法（唯一可靠的）：重启这台机器，然后回到本面板看状态${NC}"
-    echo -e "  ${CYAN}    菜单 3/4 显示 ${GREEN}[保守档]${CYAN}/${GREEN}[中转档]${CYAN} 就是真的重放了；${NC}"
-    echo -e "  ${CYAN}    显示 ${YELLOW}[配置未生效]${CYAN} 说明没重放，那段启动配置得再查${NC}"
-    echo -e "  ${CYAN}    也可直接比一条: sysctl -n net.core.rmem_max（重启后应仍是调优值）${NC}"
+    echo -e "  ${CYAN}核实: 重启后回来看菜单状态即可确认${NC}"
     return 0
 }
 
 wsl_boot_hint() {
     if ! is_wsl; then
-        echo -e "  ${CYAN}请把 $SYSCTL_APPLY 挂到你的 init 流程（sysvinit 可放进 /etc/rc.local）${NC}"
+        echo -e "  ${CYAN}挂到 init: 把 $SYSCTL_APPLY 加进 /etc/rc.local 或等效位置${NC}"
         return 0
     fi
     local cur
     cur=$(wsl_boot_command)
-    echo -e "  ${CYAN}WSL 挂载办法：编辑 /etc/wsl.conf 的 [boot] 段${NC}"
     if [ -n "$cur" ]; then
-        # [人工决策-2026-08-05 14:22:07] 已有 command= 时给串联写法而不是让用户再加一行：
-        # WSL 只认第一条 command，加第二行会静默把用户原有的开机命令顶掉。
-        # 实测机器上就有一条 zram_swap.sh，照抄「新增一行」会让 zram swap 消失
-        echo -e "  ${YELLOW}    注意：已有 command=$cur，WSL 只认一条，别再加一行${NC}"
-        # 原命令要塞进单引号里，所以必须先把其中的单引号转义成 '\''。
-        # 判例：cur=/bin/sh -c 'echo hi' 时，不转义会生成
-        #   command=/bin/sh -c '/bin/sh -c 'echo hi'; ...'
-        # 引号在此断裂，实测两段都不执行——本意是「保留原命令」，结果是给出一条
-        # 不可用且会改坏用户启动配置的指令
         local esc
         esc=$(printf '%s' "$cur" | sed "s/'/'\\\\''/g")
-        echo -e "  ${CYAN}    改成串联: command=/bin/sh -c '$esc; $SYSCTL_APPLY'${NC}"
-        case "$cur" in
-        *\'*)
-            # 原命令本身带引号时，串联写法会变得很难读。给一条等价且不必转义的替代：
-            # 自己写个小脚本按顺序调两者，command= 只指向那个脚本
-            echo -e "  ${YELLOW}    原命令含单引号，上面已按 shell 规则转义；${NC}"
-            echo -e "  ${YELLOW}    若看不顺眼可改为自建一个脚本依次调用两者，command= 只写那个脚本${NC}"
-            ;;
-        esac
+        echo -e "  ${CYAN}WSL 只认一条 command，已有 command=$cur，改成串联:${NC}"
+        echo -e "  ${CYAN}    command=/bin/sh -c '$esc; $SYSCTL_APPLY'${NC}"
     else
-        echo -e "  ${CYAN}    [boot]${NC}"
-        echo -e "  ${CYAN}    command=$SYSCTL_APPLY${NC}"
+        echo -e "  ${CYAN}WSL 挂法: /etc/wsl.conf 加 [boot] command=$SYSCTL_APPLY${NC}"
     fi
-    echo -e "  ${CYAN}    改完在 Windows 侧执行 wsl --shutdown 重启本发行版${NC}"
-    echo -e "  ${CYAN}  或改用 systemd（一次到位，菜单 5 的开机单元也会随之可用）：${NC}"
-    echo -e "  ${CYAN}    同一段写 systemd=true，注意开了 systemd 后 command= 的行为需自行验证${NC}"
+    echo -e "  ${CYAN}改完执行 wsl --shutdown 重启${NC}"
     return 0
 }
 
-# 「sysctl 会重放」不等于「BBR 会回来」：BBR 是模块时得先有人 modprobe，
-# 而 /etc/modules-load.d 只有 systemd 读。模块没加载时内核直接拒绝
-# tcp_congestion_control=bbr，重启后静默回到 cubic——而 sysctl 那边全绿。
 # [人工决策-2026-08-05 15:47:12] 判例：sysvinit 机器上 procps 会重放 /etc/sysctl.d，
 # 早期版本据此报「已持久化」，但 BBR 实际没恢复。所以模块与参数必须分别核实、分别报
-# 写 tcp_bbr 的开机加载配置。返回 0 = 已落地（或演练模式跳过），非 0 = 没写成。
-#
-# 抽成函数是因为两处都要用：菜单 2（enable_bbr）本来就写它，而菜单 3/4 也把
-# tcp_congestion_control=bbr 写进了主配置——那时如果 tcp_bbr 是模块且开机没人加载，
-# 重启后内核会静默拒绝 bbr、回到 cubic。
 # [人工决策-2026-08-05 22:41:09] 菜单 3/4 从「只给人工命令」改为「自动补齐」：
 # 它们已经在写 tcp_congestion_control=bbr 了，不配齐模块加载等于写了一个重启就失效的
 # 参数——那本身就不自洽。$BBR_MODLOAD 已在菜单 6 的清理清单里，可完整回退。
@@ -1040,10 +994,6 @@ write_bbr_modload() {
 }
 
 bbr_persist_note() {
-    # 只有本次确实写了 BBR 配置才需要交代模块的事。
-    # 判据不能只看 $BBR_OPT：菜单 3/4 把 tcp_congestion_control=bbr 写进主配置文件，
-    # 那时 $BBR_OPT 并不存在，于是「只跑菜单 3」的用户在无 systemd 环境下
-    # 拿不到任何模块加载的提示，重启后 bbr 被内核静默拒绝、回到 cubic。
     # [人工决策-2026-08-05 16:41:07] 改为「本次写的文件或任一受管文件里含 bbr」
     if [ "$1" != "$BBR_OPT" ] && [ ! -f "$BBR_OPT" ]; then
         # 本次写的那个文件里有 bbr 吗
@@ -1057,28 +1007,19 @@ bbr_persist_note() {
     case $? in
     0) return 0 ;;
     2)
-        echo -e "  ${CYAN}tcp_bbr 是内核模块。$(basename "$SYSCTL_APPLY") 在本次开机早期运行过，${NC}"
-        echo -e "  ${CYAN}它会先 modprobe tcp_bbr 再应用 sysctl，所以 BBR 看起来能随开机恢复${NC}"
-        echo -e "  ${YELLOW}同上：这是运行痕迹而非确证。若想要一个与本面板无关的保底，${NC}"
-        echo -e "  ${YELLOW}可把 tcp_bbr 单独写进 /etc/modules（Debian 系 kmod 开机会读它）${NC}"
+        echo -e "  ${CYAN}BBR 模块: 重放脚本含 modprobe，看起来可恢复${NC}"
         return 0
         ;;
     esac
-    echo -e "  ${YELLOW}但 tcp_bbr 是内核模块，开机没有人加载它——模块未加载时内核会拒绝${NC}"
-    echo -e "  ${YELLOW}tcp_congestion_control=bbr，于是重启后静默回到 cubic（sysctl 那边看不出问题）${NC}"
+    echo -e "  ${YELLOW}BBR 模块: 开机无人加载，重启后回到 cubic${NC}"
 
-    # 补救办法必须按「本机由谁负责开机加载模块」分流。
     # [人工决策-2026-08-05 21:07:44] 原先不分 systemd 与否，一律生成 $SYSCTL_APPLY
     # 并调 wsl_boot_hint。但那套「脚本 + 自己挂进启动链」只对无 systemd 的机器成立：
     # systemd 机器上没人会去执行那个脚本，提示等于让用户照着做也不生效，
     # 而真正的问题是 modules-load.d 没配好——给错方向的 remediation 比不给更糟。
     if has_systemd; then
-        # systemd 机器的正解是写 modules-load.d，由 systemd-modules-load 在开机时读。
-        # 直接补齐而不是只给命令：菜单 3/4 已经把 tcp_congestion_control=bbr 写进主配置了，
-        # 不配齐模块加载等于写了一个重启就失效的参数，那本身不自洽。
-        # 该文件在菜单 6 的清理清单里，可完整回退
         if write_bbr_modload; then
-            echo -e "  ${GREEN}已补写 $BBR_MODLOAD${NC}（让 systemd-modules-load 开机加载 tcp_bbr）"
+            echo -e "  ${GREEN}已补写 $BBR_MODLOAD${NC}（systemd-modules-load 开机加载 tcp_bbr）"
             return 0
         fi
         echo -e "  ${RED}补写 $BBR_MODLOAD 失败（只读 /etc、磁盘满，或该路径是符号链接）${NC}"
@@ -1088,34 +1029,29 @@ bbr_persist_note() {
 
     # 无 systemd：那份重放脚本才是有效手段，它会先 modprobe 再应用 sysctl
     if write_sysctl_apply; then
-        echo -e "  ${GREEN}已生成 $SYSCTL_APPLY${NC}（它会先 modprobe tcp_bbr 再应用 sysctl）"
+        echo -e "  ${GREEN}已生成 $SYSCTL_APPLY${NC}（含 modprobe tcp_bbr）"
         wsl_boot_hint
     else
-        # 兜底：脚本写不出来时至少给出 /etc/modules 这条不依赖本脚本的办法
-        echo -e "  ${YELLOW}请把 tcp_bbr 加进 /etc/modules（Debian 系 sysvinit 会读它）${NC}"
+        echo -e "  ${YELLOW}手动补: echo tcp_bbr >> /etc/modules${NC}"
     fi
     return 1
 }
 
-# 菜单 2/3/4 写完配置后统一调这里报持久化状态，禁止各自打印「已持久化」。
-# 能重放就照常说，不能就如实说「本次有效、开机不会自动重放」并按环境给出具体办法。
-# 措辞必须指名道姓说清是谁在重放：报错的机制会让用户去查错的地方
+# 菜单 2/3/4 写完配置后统一调这里报持久化状态
 report_sysctl_persist() {
     local conf=$1
     if has_systemd; then
-        # 顺序要紧：先核 BBR 模块的事，再下持久化结论。
         # [人工决策-2026-08-05 22:52:17] 原先先打印绿色「配置持久化于」再调
         # bbr_persist_note，于是「已持久化」和随后「重启会回到 cubic」同屏出现、自相矛盾。
         # 现在 bbr_persist_note 会自动补齐 modules-load.d，补上了才报绿；
         # 补不上就降级成黄字——结论必须与实际状态一致
         if bbr_persist_note "$conf"; then
-            echo -e "  ${GREEN}配置持久化于 $conf（开机由 systemd-sysctl 重放）${NC}"
+            echo -e "  ${GREEN}已持久化 ($conf)${NC}"
         else
-            echo -e "  ${YELLOW}配置已写入 $conf（开机由 systemd-sysctl 重放），但 BBR 那一项见上${NC}"
+            echo -e "  ${YELLOW}已持久化 ($conf)，但 BBR 那一项见上${NC}"
         fi
         return 0
     fi
-    # 我们的重放脚本在本次开机早期跑过：这是「看起来挂好了」的迹象，不是确证。
     # [人工决策-2026-08-05 21:29:17] 措辞必须留有余地，不能说成「已持久化」——
     # 判例：用户跑过一次后把 rc.local 里那行删掉，本次 boot 内运行痕迹还在，
     # 但下次开机不会再重放；「配置还在不在」无法从运行痕迹推出来。
@@ -1124,9 +1060,7 @@ report_sysctl_persist() {
     if sysctl_apply_ran_at_boot; then
         # 脚本仍要重写一遍：挂着的可能是旧版本，或路径被换过
         if write_sysctl_apply; then
-            echo -e "  ${GREEN}配置已写入 $conf，本次已生效${NC}"
-            echo -e "  ${CYAN}检测到 $(basename "$SYSCTL_APPLY") 在本次开机早期运行过（uptime $(sysctl_apply_stamp_up)s），看起来已挂进启动链${NC}"
-            echo -e "  ${YELLOW}这只是运行痕迹，不能证明那段配置现在还在——请确认后再当作已持久化${NC}"
+            echo -e "  ${GREEN}本次已生效${NC} | 开机重放脚本有运行痕迹（只是运行痕迹，请重启确认）"
             wsl_boot_hint_verify
             bbr_persist_note "$conf"
             return 0
@@ -1134,36 +1068,29 @@ report_sysctl_persist() {
         echo -e "  ${RED}开机重放脚本 $SYSCTL_APPLY 写入失败，重启后配置会失效${NC}"
         return 1
     fi
-    # 没挂我们的脚本，但发行版自带的机制会应用 /etc/sysctl.d（sysvinit 的 procps、
-    # openrc 的 sysctl 服务）。这条必须与上一条分开说：那时重放的不是我们的脚本，
-    # 说成「由 tcp-dashboard-sysctl-apply.sh 重放」会让用户以为脚本已挂好（实测判例）。
-    # 且它只管 sysctl，模块加载要另外交代，所以下面 bbr_persist_note 仍会核一遍
+    # 发行版自带的机制重放（procps / openrc），须与上面分开说明来源
     if sysctl_replay_ok; then
-        echo -e "  ${GREEN}配置持久化于 $conf${NC}${YELLOW}（开机由本机自带的 sysctl 服务重放，非本面板的脚本）${NC}"
+        echo -e "  ${GREEN}已持久化 ($conf)${NC}（由系统自带的 sysctl 服务重放，非本面板的脚本）"
         bbr_persist_note "$conf"
         return 0
     fi
 
-    echo -e "  ${YELLOW}配置已写入 $conf，本次已生效${NC}"
+    echo -e "  ${YELLOW}本次已生效，但重启后回到原值${NC}"
     if is_container; then
-        # 容器里多数 net.* 本来就不在命名空间内，持久化由宿主决定，写脚本没意义
-        echo -e "  ${YELLOW}但本机是容器，开机不会重放 /etc/sysctl.d/，且多数参数由宿主内核决定${NC}"
-        echo -e "  ${YELLOW}要持久化请在宿主上设置，或用 docker run --sysctl 逐项传入${NC}"
+        # 措辞必须同时含「本机是容器」与「开机不会重放」：distro-test 与用户都靠这两句
+        # 区分「容器限制」与「无 systemd 主机」——合并成「容器环境」后两处断言同时漂
+        echo -e "  ${YELLOW}本机是容器，开机不会重放 /etc/sysctl.d/，持久化请在宿主上设置或用 docker run --sysctl${NC}"
         return 1
     fi
-    echo -e "  ${YELLOW}但本机没有 systemd，开机不会有人读 /etc/sysctl.d/，重启后回到原值${NC}"
+    echo -e "  ${YELLOW}本机没有 systemd，开机不会有人读 /etc/sysctl.d/，重启后回到原值${NC}"
     write_sysctl_apply || return 1
-    echo -e "  ${GREEN}已生成开机重放脚本 $SYSCTL_APPLY${NC}（sysctl + BBR 模块 + 网卡队列一并重放）"
+    echo -e "  ${GREEN}已生成 $SYSCTL_APPLY${NC}"
     wsl_boot_hint
-    # 这条分支也要交代 BBR：它是「什么都没挂」的情况，模块加载的提醒在这里最要紧。
-    # 漏掉的话只跑菜单 3（bbr 写进主配置文件）的用户拿不到任何模块相关提示
     bbr_persist_note "$conf"
     return 1
 }
 
-# 取内核当前值与目标值中的较大者，即红帽 tuned 的 "=>"（只升不降）语义。
-# 直接赋值的写法会在内核默认值抬高后把参数写回旧值——社区脚本里 tcp_rmem 中间值
-# 常年停在 87380 就是这么来的。对「容量类」参数（缓冲区/队列/句柄）一律走这里
+# 取内核当前值与目标值中的较大者（红帽 tuned "=>" 语义，只升不降）
 sysctl_ceil() {
     local key=$1 want=$2 cur
     cur=$(sysctl -n "$key" 2>/dev/null)
@@ -1187,10 +1114,7 @@ sysctl_ceil3() {
     echo "$w1 $w2 $w3"
 }
 
-# 本脚本可能改动的全部 sysctl key。回退要按这份清单逐个还原运行时值——
-# 删掉配置文件再 sysctl --system 是不够的：sysctl 只应用「文件里还写着的」值，
-# 对「文件里已经没有的」key 不做任何事，运行时值会原样留着。
-# 中转档的 ip_forward 留在 1 尤其是安全问题（机器仍在当路由器转包）
+# 回退时按此清单逐个还原运行时值（删文件+sysctl --system 不够，已删 key 的值不会被清）
 MANAGED_KEYS="
 net.ipv4.tcp_congestion_control
 net.core.default_qdisc
@@ -1216,16 +1140,20 @@ net.ipv4.tcp_tw_reuse
 net.ipv4.tcp_fin_timeout
 net.ipv4.tcp_fastopen
 net.ipv4.ip_forward
+fs.nr_open
+net.ipv6.conf.all.disable_ipv6
+net.ipv6.conf.default.disable_ipv6
+net.ipv6.conf.lo.disable_ipv6
 "
 
-# 目标是符号链接时拒绝写入。返回 0 = 可以写，1 = 拒绝。
-#
-# 场景确实罕见（正常系统上 /etc/sysctl.d/zz-tcpo.conf 这种自有文件名不会是链接），
-# 但处置方式值得明确：
-#   - 跟着链接写出去，内容会落到一个我们没预期的位置（可能是共享挂载、可能是 /dev/null，
-#     后者是 systemd 官方推荐的「禁用某个 vendor 配置」的做法）；
-#   - 删掉链接再写，等于替用户做了个他没同意的决定，而且那个链接可能是他自己建的。
-# 所以两个都不做，直接拒绝并把情况说清楚，让用户自己确认那个目标是不是他想改的。
+# 关闭 IPv6 要写的三个 key，与 MANAGED_KEYS 里的 ipv6 三项必须是同一组。
+# 单列一份是因为菜单 i 只写这三项、回退只需还原这三项，而 MANAGED_KEYS 是全量清单
+IPV6_KEYS="
+net.ipv6.conf.all.disable_ipv6
+net.ipv6.conf.default.disable_ipv6
+net.ipv6.conf.lo.disable_ipv6
+"
+
 # [人工决策-2026-08-05 13:47:12] 取「拒绝」而非「跟随」或「删除」：本项目最坏情况
 # 必须停在「参数没生效」，而跟随链接写出去可能改到完全无关的文件——那超出了最坏边界
 refuse_if_symlink() {
@@ -1239,14 +1167,8 @@ refuse_if_symlink() {
     return 1
 }
 
-# 从 stdin 读内容，原子写入目标文件（先落临时文件再 mv）。
-#
-# 为什么状态文件必须这么写：直接 `{ ... } >"$FILE"` 会先把目标截断成 0 字节再逐步写入，
-# 磁盘满 / 进程被 SIGKILL / OOM 时目标就停在空文件或半截内容上。而 $ORIG_STATE 和
-# $TAKEOVER_LIST 是回退的唯一依据——它们变空等于回退能力归零，机器被永久留在改过的状态。
-# 本项目的优先级是「可回退性 > 正确性 > 效果」，所以这两个文件不能用直接重定向。
-# mv 在同一文件系统内是 rename(2)，原子：要么是旧内容要么是新内容，不会有中间态。
-# 临时文件必须建在目标同目录，跨设备 mv 会退化成 copy+unlink 从而失去原子性
+# 原子写入：先落同目录临时文件再 mv（rename(2) 原子，不会有半截状态）。
+# 状态文件（$ORIG_STATE/$TAKEOVER_LIST）是回退唯一依据，变空=回退能力归零
 atomic_write() {
     local target=$1 dir tmp
     refuse_if_symlink "$target" || return 1
@@ -1277,22 +1199,79 @@ atomic_append() {
     } | atomic_write "$target"
 }
 
-# 快照原始值，供回退逐个还原。只在文件不存在时写，避免二次运行把已调过的值当成原始值。
-# 任何会改动运行时状态的入口（菜单 2/3/4/5）都必须先调它——否则用户只跑菜单 2 再回退，
-# 会被 orig_value 的兜底值改成 cubic/fq_codel，而机器原本可能就不是这套值
+# 本版本新增到 MANAGED_KEYS 的 key，供老快照补齐（见 append_missing_originals）。
+# 加新参数时把它列进来，下一个版本再清空——留着不会出错（老快照补过就不再补），
+# 但清空能让「哪些是本版本新增」这件事保持准确
+NEW_MANAGED_KEYS="$IPV6_KEYS"
+
+# 给「本版本新增到 MANAGED_KEYS 的 key」补一次快照。
+# [人工决策-2026-08-16 16:50:51] 起因是加菜单 i（关闭 IPv6）时发现的缺陷：
+# save_original_values 在快照文件已存在时整个跳过，于是老用户升级后新增 key 永远没有原值，
+# restore_managed_keys 把「读不到」记为跳过——参数改得进去、回退还不回来，
+# 而回退能力是本项目的最高优先级。
+#
+# 只补显式传入的 key，绝不遍历整个 MANAGED_KEYS。判例（本轮实测踩到）：
+# 按「快照里没这一行就补」遍历全清单时，一台已经跑过 tcpo 的机器上
+# netdev_budget=600、tcp_rmem 第三值 11MB 这些**已被本脚本调过的值**
+# 会被当成原始值写进快照，回退于是还原到调过的值——比不还原更糟，
+# 因为它看起来成功了。安全的前提是「老版本从不写这个 key，所以现值必然是原值」，
+# 这个前提只对本版本新增的 key 成立，必须由调用方显式声明而不是靠推断
+append_missing_originals() {
+    local keys=$1 k v add=""
+    [ -n "$keys" ] || return 0
+    for k in $keys; do
+        orig_value "$k" >/dev/null 2>&1 && continue
+        if v=$(sysctl -n "$k" 2>/dev/null); then
+            add="$add$k=$(printf '%s' "$v" | tr -s ' \t' ' ' | sed 's/^ //;s/ $//')
+"
+        else
+            add="$add$k=ABSENT
+"
+        fi
+    done
+    [ -n "$add" ] || return 0
+    {
+        cat "$ORIG_STATE"
+        printf '%s' "$add"
+    } | atomic_write "$ORIG_STATE" || {
+        echo -e "  ${RED}补写新增参数的原始值快照失败（磁盘满或 $STATE_DIR 不可写），中止${NC}" >&2
+        echo -e "  ${RED}没有快照就无法可靠回退，不继续改动${NC}" >&2
+        return 1
+    }
+    return 0
+}
+
+# 快照原始值。只在文件不存在时写，避免二次运行把已调过的值当原始值；
+# 文件已存在时只补齐缺失的 key（见 append_missing_originals）
 save_original_values() {
     mkdir -p "$STATE_DIR"
-    [ -f "$ORIG_STATE" ] && return
+    # [人工决策-2026-08-16 16:50:51] 快照前必须确保 sysctl 命令存在，且缺了要中止。
+    # 判例（rockylinux:9 最小镜像实测）：该镜像不自带 sysctl（procps-ng 未装），
+    # 于是快照里每个 key 都写成 ABSENT——而 ABSENT 的语义是「本内核没这个 key，
+    # 回退时跳过」。两种完全不同的情况共用一个标记，结果是整份快照变成废纸：
+    # 参数照样改得进去（写文件不需要 sysctl 命令），回退时全部跳过，机器停在改后状态。
+    # 这比没有快照更糟——没有快照会报警告，而这种情况回退会报「成功」。
+    # 所以宁可不改：项目原则「备份失败必须放弃后续改动，可回退性优先于参数生效」
+    if ! command -v sysctl >/dev/null 2>&1; then
+        ensure_tools sysctl >/dev/null
+        if ! command -v sysctl >/dev/null 2>&1; then
+            echo -e "  ${RED}缺 sysctl 命令且自动安装失败，无法读取原始值，中止${NC}" >&2
+            echo -e "  ${RED}读不到原值时快照会把全部参数记成「不存在」，回退将静默跳过一切${NC}" >&2
+            echo -e "  ${YELLOW}手动补装后重试（包名: procps-ng / procps）${NC}" >&2
+            return 1
+        fi
+    fi
+    [ -f "$ORIG_STATE" ] && {
+        append_missing_originals "$NEW_MANAGED_KEYS" || return 1
+        return 0
+    }
     {
         echo "# tcp-dashboard 首次运行前的原始值 $(date '+%F %T')"
         echo "# 格式 key=value；ABSENT 表示该 key 在本内核/命名空间不存在，回退时跳过。"
         echo "# 空值（key= 后面什么都没有）是合法原值，回退时要写回空串而不是跳过"
         local k v
         for k in $MANAGED_KEYS; do
-            # 必须用退出码而不是「值是否为空」来判断 key 存不存在：
-            # ip_local_reserved_ports 在「原本没有保留端口」时合法值就是空串（rc=0），
-            # 把它记成 ABSENT 会让回退跳过它，菜单 3/4 写进去的保留端口一直留到重启。
-            # 真正不存在的 key（含容器里的 net.core.*）rc=1
+            # 用退出码判 key 存不存在，不用值是否为空（ip_local_reserved_ports 合法值就是空串）
             if v=$(sysctl -n "$k" 2>/dev/null); then
                 # 三元组等多值参数里的空白统一成单空格，便于回退时原样写回
                 echo "$k=$(printf '%s' "$v" | tr -s ' \t' ' ' | sed 's/^ //;s/ $//')"
@@ -1309,8 +1288,7 @@ save_original_values() {
     }
 }
 
-# 读回快照里的原始值。没有快照或该 key 记的是 ABSENT 时返回空，调用方据此跳过——
-# 不再用硬编码兜底值去猜，猜错就是把用户的机器改成另一个状态
+# 读回快照里的原始值，没有则返回 1
 orig_value() {
     local key=$1
     [ -f "$ORIG_STATE" ] || return 1
@@ -1325,12 +1303,30 @@ restore_managed_keys() {
         echo -e "  ${YELLOW}没有原始值快照，跳过运行时值还原（配置文件已删除，重启后即为系统默认）${NC}"
         return 0
     fi
+    # [人工决策-2026-08-16 22:31:43] 缺 sysctl 时必须失败返回，不能把每个 -w 计成
+    # skipped 后让调用方打印「回退完成」。那是假回退：配置文件删了、运行时值全留着
+    if ! command -v sysctl >/dev/null 2>&1; then
+        echo -e "  ${RED}缺 sysctl 命令，无法写回任何运行时值${NC}"
+        echo -e "  ${YELLOW}配置文件若已删除，重启后多数参数回系统默认；本次运行时状态未动${NC}"
+        return 1
+    fi
+    # 整份快照都是 ABSENT 说明它是在「读不到任何 sysctl 值」的环境下建的
+    # （旧版本在缺 sysctl 命令的机器上会写出这种快照，见 save_original_values 的判例）。
+    # 这种快照无法自愈：参数已经被调过，现在重新采样只会把调过的值当成原值写回去，
+    # 那比不还原更糟。所以只能如实告知用户，让他自己决定各项该设回什么
+    local total_lines absent_lines
+    total_lines=$(grep -c '^[a-z].*=' "$ORIG_STATE" 2>/dev/null)
+    absent_lines=$(grep -c '=ABSENT$' "$ORIG_STATE" 2>/dev/null)
+    if [ "${total_lines:-0}" -gt 0 ] && [ "$absent_lines" = "$total_lines" ]; then
+        echo -e "  ${RED}快照里全部 $total_lines 项都记为「不存在」，无法还原任何运行时值${NC}"
+        echo -e "  ${YELLOW}原因：这份快照是在读不到 sysctl 值的环境下建的（通常是缺 sysctl 命令）${NC}"
+        echo -e "  ${YELLOW}配置文件已删除，重启后各项回到系统默认值；本次不逐项写回${NC}"
+        echo -e "  ${YELLOW}（不重新采样：参数已被本脚本调过，现值不是原值，写回去等于固化调后状态）${NC}"
+        return 1
+    fi
     for k in $MANAGED_KEYS; do
-        # orig_value 返回非 0 = 快照里没这一行；返回 0 且值为空 = 原值就是空串，要写回去
         v=$(orig_value "$k") || { skipped=$((skipped + 1)); continue; }
-        # ABSENT 表示快照时该 key 在本内核/命名空间不存在，不能瞎写。
-        # 注意不能用 [ -z "$v" ] 当跳过条件——空串是 ip_local_reserved_ports 的合法原值，
-        # sysctl -w key= 正是清空它的办法
+        # ABSENT=本内核无此 key；空串是合法原值（ip_local_reserved_ports），不能跳
         [ "$v" = "ABSENT" ] && { skipped=$((skipped + 1)); continue; }
         if [ "$DRYRUN" = "1" ]; then
             skipped=$((skipped + 1))
@@ -1342,11 +1338,25 @@ restore_managed_keys() {
         fi
     done
     echo -e "  已还原 ${GREEN}${restored}${NC} 项运行时值（$skipped 项不可写或原本不存在，已跳过）"
+    # 一项都没还原且不是演练 = 可能是假回退。快照里有非 ABSENT 项却全写失败才算失败
+    if [ "$DRYRUN" != "1" ] && [ "$restored" -eq 0 ]; then
+        local has_real
+        has_real=$(awk -F= '
+            $1 ~ /^[a-z]/ {
+                v = substr($0, index($0, "=") + 1)
+                if (v != "ABSENT") n++
+            }
+            END { print n + 0 }
+        ' "$ORIG_STATE" 2>/dev/null)
+        if [ "${has_real:-0}" -gt 0 ]; then
+            echo -e "  ${RED}快照里有 $has_real 项可还原，但一项都没写回去${NC}"
+            return 1
+        fi
+    fi
+    return 0
 }
 
-# 累加 /proc/net/softnet_stat 指定列（每 CPU 一行、值为十六进制）。
-# 不能用 awk 的 strtonum：那是 GNU 扩展，Debian/Ubuntu 默认的 mawk 没有，
-# 结果会是空值而非数字（症状是显示 "?"）。用 shell 的 $((16#..)) 做转换
+# 累加 /proc/net/softnet_stat 指定列（十六进制），不用 awk strtonum（mawk 没有）
 softnet_sum() {
     local col=$1 sum=0 v
     while read -r -a f; do
@@ -1359,18 +1369,9 @@ softnet_sum() {
     echo "$sum"
 }
 
-# 删掉本脚本加的 MSS clamp 规则。
-#
-# 为什么不能只靠精确文本匹配（`iptables -D` 原样传回添加时的参数）：
-#   1) 参数写法一变（改了链、加了 -o 限定、内核规范化了 --tcp-flags 的表示）就删不掉，
-#      规则永久残留在链里；
-#   2) 无法区分「本脚本加的」和「用户自己加的同款规则」，回退时会把用户的一并删掉。
-# 所以加规则时打 comment 标记，删除时从 iptables-save 里按标记反查——那是 iptables
-# 唯一的所有权表达方式。实测验证：用户手加的同款规则不带标记，不会被误删。
-#
-# 用 iptables-save 而不是 `iptables -t mangle -S`：后者在 mangle 表未使用时会把
-# iptable_mangle 模块加载进内核，这里是回退路径不该有额外副作用。
-# 旧版本（无 comment）加的规则用精确匹配兜底删除，否则升级过来的用户会留残余
+# 按 comment 标记删本脚本加的 MSS clamp 规则。
+# 用 iptables-save（不用 -S，后者会加载 iptable_mangle 模块）。
+# 旧版本（无 comment）的规则用精确匹配兜底
 del_owned_mss() {
     command -v iptables >/dev/null 2>&1 || return 0
     if [ "$DRYRUN" = "1" ]; then echo 0; return 0; fi
@@ -1408,25 +1409,13 @@ egress_dev() {
         awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
 }
 
-# 一次性取齐全部内核网络计数器，输出 key=value。诊断与效果测量共用这一份。
-#
-# 有 nstat 就用（输出已经是 名字 值 两列，最规整），没有则直读 /proc——
-# 最小化容器与 busybox 环境常缺 iproute2，而只读功能不装包（见 require_tools_readonly），
-# 缺了就整段诊断失效未免太脆。/proc/net/snmp 与 /proc/net/netstat 是 nstat 自己的数据源，
-# 两者拿到的是同一批数字。
-#
-# 这两个文件的格式是「两行一组」：奇数行 "族名: 字段名 字段名 ..."，
-# 偶数行 "族名: 值 值 ..."，靠列位置对应。拼出的 key 与 nstat 命名一致
-# （族名直接前缀，如 TcpExt + ListenOverflows = TcpExtListenOverflows），
-# 这样两条路径的下游判据代码完全共用，不必写两套。
-# 同一族可能出现多次（IpExt 在 netstat 里就有两组），所以 seen 只认第一次的表头。
+# 取齐全部内核网络计数器（key=value）。有 nstat 用 nstat，没有则直读 /proc
 read_counters() {
     if command -v nstat >/dev/null 2>&1; then
-        # -s 不写 /tmp 历史文件（保持只读），-az 输出全部计数器含为 0 的
         nstat -saz 2>/dev/null | awk 'NF>=2 {print $1"="$2}'
         return
     fi
-    # 纯 POSIX awk：不用 gensub/strtonum/asort 之类 GNU 扩展，mawk 与 busybox awk 均可
+    # /proc/net/snmp + netstat 格式：两行一组（表头行+值行），拼出的 key 与 nstat 一致
     awk '
         {
             fam = $1
@@ -1442,19 +1431,11 @@ read_counters() {
     ' /proc/net/snmp /proc/net/netstat 2>/dev/null
 }
 
-# 从 read_counters 的输出里取一个计数器。取不到回 空串（调用方据此显示「-」而不是 0——
-# 「读不到」和「确实是 0」是两回事，后者能作判据，前者不能）
 counter_get() {
     printf '%s\n' "$2" | awk -F= -v k="$1" '$1==k {print $2; exit}'
 }
 
-# 网卡出向队列的累计丢包数（全部队列之和）。
-#
-# 必须累加而不是只取第一处：多队列网卡的第一行是 mq 的汇总，实际丢包发生在各叶子
-# 队列上。喂 root=0 / leaf=12 / leaf=30 的样例，取首处得 0，真实是 42。
-# [人工决策-2026-08-05 15:12:08] 抽成函数是因为 diagnose 与 counter_snapshot 都要用，
-# 而它们原先各写一份 awk——修了 diagnose 那份、漏了 counter_snapshot 那份，
-# 于是菜单 8 报得对、菜单 a 仍在多队列机器上读成 0。同一份判据只留一处实现
+# [人工决策-2026-08-05 15:12:08] 必须累加全部队列丢包，多队列网卡第一行是 mq 汇总（常为 0）
 qdisc_drops() {
     local dev=$1
     [ -n "$dev" ] || { echo 0; return; }
@@ -1467,13 +1448,7 @@ qdisc_drops() {
              END { print s+0 }'
 }
 
-# 网卡实际生效的 root qdisc 类型，以及多队列情况下的叶子 qdisc。
-# 输出一行：root<TAB>叶子类型（去重后空格分隔，非多队列时叶子为空）
-#
-# 为什么不能只看第一行：多队列网卡的 root 恒为 mq/mqprio，真正的 qdisc 挂在每个
-# 硬件队列的叶子上（parent :1 ... :N）。内核文档说得很明确——多队列网卡 root 保持 mq，
-# default_qdisc 作用在叶子上（"multiqueue NICs keep mq as root and use this for leaves"）。
-# 所以拿 root 去和 default_qdisc 比，在任何多队列机器上都必然报「不一致」，是假警告
+# 输出 root<TAB>叶子类型。多队列网卡 root 恒为 mq，真正 qdisc 在叶子上
 qdisc_kinds() {
     local dev=$1
     [ -n "$dev" ] || return 1
@@ -1493,15 +1468,9 @@ qdisc_kinds() {
 # ==================================================
 # --- 自动安装 ---
 # ==================================================
-# 判据：脚本不是从 $SCRIPT_PATH 跑的（管道执行或首次本地执行）就装到本地再 exec 过去。
-# 仍要解析符号链接——用户可能自己建了软链指过来，直接比 $0 会让每次运行都重跑一遍安装，
-# 且 cp 源与目标是同一文件时报 "are the same file"
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
-# 演练模式不装自己：装到 /usr/local/bin 是实打实的系统改动，而演练承诺零写入。
-# 顺带这也让非 root 用户能直接演练（自安装需要写 /usr/local/bin）。
-# 写成把 SELF 改成 SCRIPT_PATH 而不是在下面的 if 上加条件——那样会让整个安装块
-# 变成 elif，而安装块的完整性是由 site-test 按 `if [ "$SELF" != "$SCRIPT_PATH" ]`
-# 定位后逐条校验的（校验/查返回值/兜底确认共六项），改动它的开头等于让那些断言失效
+# 演练模式不装自己（零写入承诺）。写成把 SELF 改成 SCRIPT_PATH 而不是在 if 上加条件——
+# site-test 按 `if [ "$SELF" != "$SCRIPT_PATH" ]` 定位安装块逐条校验，改开头会让断言失效
 if [ "$DRYRUN" = "1" ] && [ "$SELF" != "$SCRIPT_PATH" ]; then
     echo -e "${CYAN}[演练]${NC} 跳过自安装到 $SCRIPT_PATH"
     SELF=$SCRIPT_PATH
@@ -1520,10 +1489,7 @@ if [ "$SELF" != "$SCRIPT_PATH" ]; then
             exit 1
         fi
     else
-        # 管道执行（$0 是 bash 或 /dev/fd/xx）：从分发地址下载物理文件。
-        # 先落临时文件并校验再就位——直接写 $SCRIPT_PATH 的话，站点误配返回 HTML、
-        # 传输截断或被劫持时，坏内容会直接成为正式命令且立刻被 exec。
-        # 这与菜单 7 的更新走同一套校验（validate_script），两条路径不能松紧不一
+        # 管道执行：先落临时文件、校验再就位（与菜单 7 共用 validate_script）
         if ! curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH.tmp"; then
             rm -f "$SCRIPT_PATH.tmp"
             echo -e "${RED}下载失败，请检查网络或 SCRIPT_URL: $SCRIPT_URL${NC}"
@@ -1546,22 +1512,21 @@ if [ "$SELF" != "$SCRIPT_PATH" ]; then
         exit 1
     fi
     # 最后确认一次文件真的在位且可执行。前面每步都查了返回值，这里是兜底：
-    # 少了它，任何一步的漏检都会以「已安装」+ exit 0 的形式骗过用户
+    # 漏检会让文件未落地却打印安装成功
     if [ ! -x "$SCRIPT_PATH" ]; then
         echo -e "${RED}安装失败：$SCRIPT_PATH 不存在或不可执行${NC}"
         exit 1
     fi
 
-    echo -e "${GREEN}已安装，以后任意目录输入 ${YELLOW}tcpo${GREEN} 即可打开面板。${NC}"
+    echo -e "${GREEN}已安装到 $SCRIPT_PATH${NC}"
 
-    # curl -sL URL | bash 这种管道执行时 stdin 是脚本自身的字节流、已被读完，
-    # 直接 exec 过去菜单的 read 会立刻拿到 EOF 并空转刷屏；重新绑定到 /dev/tty 才能进交互。
-    # 必须先试开一次：容器/CI 里 /dev/tty 节点存在但无控制终端，open 会 ENXIO
+    # 管道执行时 stdin 已被脚本占用，需重新绑定 /dev/tty 才能进交互；
+    # 容器/CI 可能无控制终端，先试开一次避免 ENXIO
     if [ ! -t 0 ]; then
         if { : </dev/tty; } 2>/dev/null; then
             exec bash "$SCRIPT_PATH" </dev/tty
         fi
-        # 无 tty 可绑（CI / 无控制终端的容器）：装完即止，不进交互菜单
+        # 无 tty 可绑：装完即止，不进交互菜单
         echo -e "${GREEN}安装完成。当前是非交互环境，请运行 ${YELLOW}tcpo${GREEN} 打开面板。${NC}"
         exit 0
     fi
@@ -1571,24 +1536,17 @@ fi
 # ==================================================
 # --- 维护：在线更新 / 卸载 ---
 # ==================================================
-# 启动时的版本检查。只读一个小文本文件（VERSION），发现新版只在标题栏提示，
-# 绝不自动下载或替换脚本——这台机器可能正在跑业务，换代码得由用户按菜单 7 明确触发。
-# 设计要点：
-#   - 静默失败：无网络、域名挂了、curl 没装，一律当「未知」处理，不打印任何错误
-#   - 有缓存：每 $VERSION_CACHE_TTL 秒最多查一次，避免每次开面板都等网络
-#   - 多源：自建域名在前、GitHub raw 兜底，任一可达即可
-#   - 可关：设 TCP_DASHBOARD_NO_CHECK=1 完全跳过（离线环境 / 不想让脚本联网）
+# 版本检查：只读 VERSION 文件，发现新版只提示不自动替换。静默失败、有缓存、多源、可关
 LATEST_VERSION=""
 fetch_latest_version() {
     [ -n "${TCP_DASHBOARD_NO_CHECK:-}" ] && return 0
 
-    # 缓存读取必须在 curl 检查之前：机器可能之前联网时查到过新版、后来断网或卸了 curl，
-    # 那份缓存仍然有效。反过来先判 curl 会让离线机永远读不到已缓存的结果
+    # 缓存读取在 curl 检查之前（离线机仍能读到之前的缓存）
     local now cached_at cached_ver
     now=$(date +%s 2>/dev/null) || return 0
     if [ -f "$VERSION_CACHE" ]; then
         read -r cached_at cached_ver <"$VERSION_CACHE" 2>/dev/null
-        # 时间戳必须是纯数字：文件被手改坏或时钟回拨时按「缓存失效」处理而不是算出负数
+        # 时间戳必须是纯数字
         case "$cached_at" in
         '' | *[!0-9]*) cached_at=0 ;;
         esac
@@ -1604,12 +1562,10 @@ fetch_latest_version() {
 
     local url got
     for url in $VERSION_URLS; do
-        # --max-time 是硬上限（含连接与传输），源不可达时不会卡住面板启动。
-        # tr -d 清掉可能的 \r 与换行：VERSION 文件由 CI 生成，行尾未必干净
+        # --max-time 防止源不可达时卡住启动；tr -d 清掉 CI 生成文件可能带的 \r\n
         got=$(curl -fsSL --max-time "$VERSION_TIMEOUT" "$url" 2>/dev/null |
             head -1 | tr -d ' \r\n\t')
-        # 只接受形似版本号的内容。拿到 HTML（域名被泛解析到别的站）时必须丢弃，
-        # 否则标题栏会显示一串 <!DOCTYPE html>
+        # 只接受形似版本号的内容，防止域名泛解析拿到 HTML 页面
         case "$got" in
         '' | *[!0-9.]*) continue ;;
         esac
@@ -1617,8 +1573,7 @@ fetch_latest_version() {
         break
     done
 
-    # 结果落缓存（含「查过但没查到」的情况：写空版本号，避免每次启动都重试一轮超时）
-    # 版本缓存内容无害（时间戳+版本号），但同样不跟随链接——统一规则比逐个判断可靠
+    # 结果落缓存（含「没查到」的情况，避免每次启动都重试超时）；同样拒绝跟随符号链接
     if mkdir -p "$STATE_DIR" 2>/dev/null && refuse_if_symlink "$VERSION_CACHE" 2>/dev/null; then
         printf '%s %s\n' "$now" "$LATEST_VERSION" >"$VERSION_CACHE" 2>/dev/null
     fi
@@ -1635,17 +1590,14 @@ version_hint() {
 check_update() {
     echo -e "${YELLOW}正在从 $SCRIPT_URL 同步...${NC}"
     if curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH.tmp"; then
-        # 先校验再替换：拉到 HTML（域名被泛解析）或截断的文件时，
-        # 直接 mv 过去会让 tcpo 从此起不来，而这台机器可能正在远程 SSH 里。
-        # 与首次安装共用 validate_script，两条路径的严格程度必须一致
+        # 先校验再替换，避免拉到 HTML/截断文件时把 tcpo 换坏；与首次安装共用 validate_script
         if ! validate_script "$SCRIPT_PATH.tmp"; then
             rm -f "$SCRIPT_PATH.tmp"
             echo -e "${RED}更新失败：$SCRIPT_URL 返回的内容未通过校验，已放弃，当前版本未改动。${NC}"
             pause_return
             return
         fi
-        # mv / chmod 都要查返回值：目标只读或磁盘满时它们只往 stderr 报一行，
-        # 不查就会打印「更新成功」再 exec 一个没换过的（甚至不存在的）文件
+        # mv/chmod 都要查返回值，否则失败时会误报「更新成功」
         if ! mv "$SCRIPT_PATH.tmp" "$SCRIPT_PATH"; then
             rm -f "$SCRIPT_PATH.tmp"
             echo -e "${RED}更新失败：无法写入 $SCRIPT_PATH（只读挂载 / 磁盘满 / 权限），当前版本未改动。${NC}"
@@ -1657,7 +1609,7 @@ check_update() {
             pause_return
             return
         fi
-        # 清掉版本检查缓存，否则新版启动后仍会读到旧缓存、继续提示「有新版」
+        # 清掉版本缓存，否则新版启动后仍会提示「有新版」
         rm -f "$VERSION_CACHE"
         echo -e "${GREEN}更新成功，正在重新载入...${NC}"
         exec bash "$SCRIPT_PATH"
@@ -1672,8 +1624,19 @@ uninstall_script() {
     echo -e "\n${RED}>>> 卸载脚本并回退全部网络优化${NC}"
     read -p "确定要卸载吗？(会同时回退所有网络优化设置) [y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        rollback_tune
-        # 状态目录里有原始值快照和接管备份，回退用得上，只在卸载时才删
+        # [人工决策-2026-08-16 22:49:27] 回退失败时绝不能删脚本和状态目录。
+        # 判例：rollback_tune 在缺 sysctl 时会清理配置文件但写不回运行时值并 return 1；
+        # 旧写法不查返回值，接着 rm -rf $STATE_DIR（快照没了）+ rm 脚本本身——
+        # 用户既丢了重试入口，又丢了唯一的原值依据，一次「未完整回退」升级成不可自救。
+        # 可回退性是最高优先级：失败就停，把现场留给用户修好后重跑菜单 6 / 卸载
+        if ! rollback_tune; then
+            echo -e "\n  ${RED}回退未完整，已中止卸载${NC}"
+            echo -e "  ${YELLOW}脚本与状态目录（含快照 $ORIG_STATE）均保留，便于修好后重试${NC}"
+            echo -e "  ${YELLOW}请确认 sysctl 可用（procps-ng / procps）后：先跑菜单 6，确认回退完成再卸载${NC}"
+            pause_return
+            return 1
+        fi
+        # 状态目录里的快照/备份只在卸载时、且回退成功后才删
         rm -rf "$STATE_DIR"
         rm -f "$SCRIPT_PATH"
         echo -e "${GREEN}卸载完成，命令 tcpo 与状态目录均已移除。${NC}\n"
@@ -1689,16 +1652,14 @@ uninstall_script() {
 set_ipv4_priority() {
     echo -e "\n${YELLOW}>>> 设置 IPv4 优先解析${NC}"
 
-    # 目标是符号链接时拒绝：跟着写会改到链接目标（可能是共享挂载上的别人的文件）。
-    # 这里改的是 /etc 下的系统文件而不是本脚本自有的 drop-in，被做成链接的可能性
-    # 比 sysctl.d 那些高（有人把 /etc 的一部分指到别处统一管理）
+    # 目标是符号链接时拒绝，避免跟着写到链接目标（这里改的是系统文件，非本脚本自有 drop-in）
     refuse_if_symlink "$GAI_CONF" || {
         pause_return
         return 1
     }
 
-    # 演练模式下 $GAI_CONF 指向临时目录，那里本来是空的。要先把真实文件拷进去，
-    # 否则会走下面「生成默认模板」的分支——演练看到的就不是这台机器真实的改动结果了。
+    # 演练模式下要先把真实文件拷进临时目录作为起点，否则会走「生成默认模板」分支，
+    # 结果与真实改动不符。
     # [人工决策-2026-08-05 15:31:20] 演练必须反映真实起点：读真实文件、写临时副本。
     # 早前版本这个函数完全绕过 DRYRUN 重定向，TCPO_DRYRUN=1 跑菜单 1 会真实改机，
     # 与「零写入」承诺直接冲突
@@ -1708,8 +1669,7 @@ set_ipv4_priority() {
     fi
 
     if [ ! -f "$GAI_CONF" ]; then
-        # 函数开头已查过一次，这里再查一次：那次到这里之间有 cp 操作，
-        # 且「文件不存在」与「是悬空链接」两种状态容易混淆
+        # 再查一次符号链接：上面的 cp 操作之后状态可能已变
         refuse_if_symlink "$GAI_CONF" || {
             pause_return
             return 1
@@ -1733,8 +1693,7 @@ EOF
         fi
     fi
 
-    # 备份失败必须放弃后续改动：回退靠这份备份整份还原，没备份成功就改原文件
-    # 等于制造不可逆状态（项目原则：可回退性优先于参数生效）
+    # 备份失败必须放弃后续改动，否则没有备份可回退
     if [ ! -f "$GAI_BAK" ]; then
         if ! cp "$GAI_CONF" "$GAI_BAK"; then
             echo -e "  ${RED}备份 $GAI_CONF 失败，中止（没有备份就无法回退）${NC}"
@@ -1764,8 +1723,7 @@ EOF
         fi
     fi
 
-    # 兜底确认结果真的落地了：前面每步都查了返回值，但 sed -i 有过「返回 0 而
-    # 文件没变」的实现差异（某些 busybox sed 版本），所以最后再回读一次
+    # 兜底回读确认：某些 busybox sed 版本会「返回 0 但文件未变」
     if ! grep -q '^precedence ::ffff:0:0/96  100' "$GAI_CONF"; then
         echo -e "  ${RED}写入命令返回成功，但回读 $GAI_CONF 里没有那一行——未真正生效${NC}"
         echo -e "  ${YELLOW}请手动检查该文件；备份在 $GAI_BAK${NC}"
@@ -1773,8 +1731,538 @@ EOF
         return 1
     fi
 
-    echo -e "${GREEN}完成：已设为 IPv4 优先（$GAI_CONF，原文件备份为 gai.conf.bak）${NC}"
+    echo -e "${GREEN}IPv4 优先已开启${NC}"
     pause_return
+}
+
+# ==================================================
+# --- i. 关闭 IPv6 ---
+# ==================================================
+# [人工决策-2026-08-16 16:50:51] 加这一项的判据与其他菜单不同，单独记在这里。
+# 起因：某些上游（实测 grok.com）对 VPS 的 IPv6 出口直接拦，而 Node/Go 这类自带
+# 解析器的程序绕过 gai.conf，菜单 1 的 IPv4 优先对它们无效——只能关掉协议族本身。
+#
+# 这是本项目唯一一个「最坏情况可能不止于参数没生效」的写入项：机器只有 IPv6 入口时
+# 关掉它就等于自断 SSH，而本面板经 SSH 使用，失联即无法自救。所以按用户要求全关
+# （all + default + lo 三项都写）的同时，必须在执行前把「会不会切断当前这条命令通路」
+# 判掉——三道拒绝闸都是硬拒绝，不给 y/N 让用户手滑：
+#   1) 当前 SSH 会话是 IPv6 连进来的
+#   2) 有 IPv6 默认路由但没有 IPv4 默认路由（唯一出口是 v6）
+#   3) 出口网卡上只有 IPv6 全局地址、没有 IPv4 地址
+# 监听 :: 的服务只警告不拒绝：那是「服务可能起不来」，属可回退范畴，由用户判断。
+# 归属文件独立（$IPV6_OPT）而非并进主配置：菜单 3/4 会整份重写主配置，混在一起
+# 会让「关了 IPv6」被一次普通调优悄悄带走或带回。不进菜单 9——一键优化里关掉
+# 一整个协议族对别人是意外的语义变更
+#
+# 关 lo 的 ::1 是用户明确要求的（[人工决策-2026-08-16 16:50:51]），但它会让
+# 绑 ::1 的本地服务（Redis、PostgreSQL 默认配置常见）起不来，所以执行前要列出来给用户看。
+# 改动此处前须与用户确认该决策是否仍有效
+
+# 取当前会话的 SSH_CONNECTION。screen/tmux 常把环境变量丢掉，沿父进程链在
+# /proc/<pid>/environ 里找；找到的值只用于判定地址族，不另作他用
+resolve_ssh_connection() {
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        printf '%s\n' "$SSH_CONNECTION"
+        return 0
+    fi
+    local pid=$$ envf val ppid
+    # 沿父进程向上最多 32 层，防异常进程树死循环
+    local n=0
+    while [ "$n" -lt 32 ]; do
+        n=$((n + 1))
+        envf="/proc/$pid/environ"
+        if [ -r "$envf" ]; then
+            # environ 是 NUL 分隔；只取 SSH_CONNECTION 那一项
+            val=$(tr '\0' '\n' <"$envf" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -1)
+            if [ -n "$val" ]; then
+                printf '%s\n' "$val"
+                return 0
+            fi
+        fi
+        # /proc/pid/stat 第 4 字段是 ppid
+        ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || break
+        case "$ppid" in '' | *[!0-9]* | 0 | 1) break ;; esac
+        [ "$ppid" = "$pid" ] && break
+        pid=$ppid
+    done
+    return 1
+}
+
+# 当前 SSH 会话是否通过 IPv6 连进来。SSH_CONNECTION 格式「客户端IP 端口 服务端IP 端口」，
+# 判客户端与服务端任一是 IPv6（含冒号即 v6，IPv4 地址里不会有冒号）。
+# 返回 0=是 v6、1=是 v4、2=未知（拿不到 SSH_CONNECTION）。
+# [人工决策-2026-08-16 22:31:43] 未知不再当作「不是 v6」放行：本项关掉唯一管理通路
+# 即失联无法自救，信息不全时必须 fail-closed。调用方对返回 2 一律拒绝或要求证明
+# 存在可用的 IPv4 管理通路（见 disable_ipv6 的闸门）
+ssh_session_af() {
+    local conn c s
+    conn=$(resolve_ssh_connection) || return 2
+    c=$(printf '%s' "$conn" | awk '{print $1}')
+    s=$(printf '%s' "$conn" | awk '{print $3}')
+    case "$c$s" in
+    *:*) return 0 ;;
+    esac
+    return 1
+}
+
+# 兼容旧名：只在「明确是 v6」时返回 0
+ssh_over_ipv6() {
+    ssh_session_af
+    [ $? -eq 0 ]
+}
+
+# 是否存在已建立的 IPv6 SSH 连接。
+# 用于 SSH_CONNECTION 拿不到时的兜底：双栈机器上 tmux 丢了环境、实际仍走 v6 登录
+# 时，光看「有 IPv4 路由」会误放行。
+# [人工决策-2026-08-16 22:49:27] 端口不能写死 22。自定义 Port 的机器（生产常见）
+# 在 SSH_CONNECTION 丢失时会被漏判，随后只要有 IPv4 路由就继续关 IPv6——正是本闸
+# 要防的场景。端口来源按可靠度：
+#   1) ss 里 sshd 正在 listen 的端口（最准，含多 Port / 非 22）
+#   2) sshd -T 的 port（配置层面，ss 读不到进程名时的兜底）
+#   3) 都拿不到才退回 22
+# 返回 0=有、1=没有；ss 缺失时返回 1，由调用方结合其他闸 fail-closed
+has_active_ipv6_ssh() {
+    command -v ss >/dev/null 2>&1 || return 1
+    local ports
+    # sshd 实际监听端口（ss -tlnp 的 users 字段含 "sshd"）
+    ports=$(ss -tlnpH 2>/dev/null | awk '
+        /"sshd"/ || /sshd,/ || /sshd\)/ {
+            n = split($4, a, ":")
+            p = a[n]
+            gsub(/[^0-9]/, "", p)
+            if (p != "") print p
+        }
+    ' | sort -u | tr '\n' ' ')
+    # 配置层 Port（ss 在容器/权限不足时可能看不到进程名）
+    if command -v sshd >/dev/null 2>&1; then
+        ports="$ports $(sshd -T 2>/dev/null | awk '/^port /{print $2}' | tr '\n' ' ')"
+    fi
+    # 去重；仍空才退回 22
+    ports=$(printf '%s\n' $ports | awk 'NF && !seen[$0]++' | tr '\n' ' ')
+    [ -n "$(printf '%s' "$ports" | tr -d ' ')" ] || ports="22"
+
+    ss -tnH state established 2>/dev/null | awk -v ps="$ports" '
+        BEGIN {
+            n = split(ps, a, /[ \t]+/)
+            for (i = 1; i <= n; i++) if (a[i] != "") ports[a[i]] = 1
+        }
+        {
+            # ss 对 v6 的本地/对端地址带 [ ]；无方括号的是 v4，跳过
+            if ($4 !~ /\[/ && $5 !~ /\[/) next
+            n = split($4, b, ":")
+            lp = b[n]
+            gsub(/[^0-9]/, "", lp)
+            if (lp != "" && (lp in ports)) { found = 1; exit }
+        }
+        END { exit !found }
+    '
+}
+
+# 有没有 IPv4 默认路由。
+# [人工决策-2026-08-16 22:31:43] 缺 ip 命令时返回 1（当作「没有/不可用」），不再
+# return 0 放行。旧写法是 fail-open：探测不了就当安全，恰恰在「仅 IPv6 管理 + 最小
+# 镜像缺 iproute」这种最需要保守的场景下把唯一通路关死。信息不全 = 拒绝
+has_ipv4_default_route() {
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -4 route show default 2>/dev/null | grep -q .
+}
+
+has_ipv6_default_route() {
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -6 route show default 2>/dev/null | grep -q .
+}
+
+# 出口网卡上有没有 IPv4 地址。缺 ip / 取不到出口 / 没有地址 → 一律返回 1（不安全）
+egress_has_ipv4() {
+    local dev
+    command -v ip >/dev/null 2>&1 || return 1
+    dev=$(egress_dev)
+    [ -n "$dev" ] || return 1
+    ip -4 -o addr show dev "$dev" 2>/dev/null | grep -q 'inet '
+}
+
+# 列出监听 IPv6 的服务，供关闭前警告。只读，缺 ss 就返回空
+ipv6_listeners() {
+    command -v ss >/dev/null 2>&1 || return 0
+    # -H 去表头，取 tcp6/udp6 的监听项；进程名列可能没有（无权限或内核不报），只取有的
+    ss -Htulnp6 2>/dev/null | awk '
+        { for (i = 1; i <= NF; i++) if ($i ~ /users:\(\(/) { print $i; found = 1 } }
+    ' | sed 's/users:((//;s/)).*//' | awk -F'"' '{print $2}' | sort -u | grep -v '^$'
+}
+
+# 关闭 IPv6 的运行时值是否已生效（三项全为 1 才算）。
+# lo 那项在部分容器里读不到，读不到按「不算已开启」处理——宁可显示未开启也不假报
+ipv6_disabled_now() {
+    local k v n=0
+    for k in $IPV6_KEYS; do
+        v=$(sysctl -n "$k" 2>/dev/null) || return 1
+        [ "$v" = "1" ] || return 1
+        n=$((n + 1))
+    done
+    [ "$n" -eq 3 ]
+}
+
+disable_ipv6() {
+    echo -e "\n${YELLOW}>>> 关闭 IPv6${NC}"
+    echo -e "  ${CYAN}用途：上游按 IPv6 出口做拦截时（实测 grok.com 一类），关掉协议族让流量只走 IPv4。${NC}"
+    echo -e "  ${CYAN}与菜单 1 的区别：菜单 1 只改解析优先级，自带解析器的程序（Node/Go）不认它。${NC}"
+
+    # sysctl 命令本身可能缺（RHEL 系最小化镜像实测如此），它是快照、应用、校验的共同前提。
+    # 缺了不能硬跑：那样三个 key 全被记成 ABSENT，写出去的文件不生效、回退也没有原值可写回，
+    # 而面板会一路报成功。项目原则「缺少必需工具时不要硬跑测量」，写入路径同理
+    ensure_tools sysctl >/dev/null
+    if ! command -v sysctl >/dev/null 2>&1; then
+        echo -e "  ${RED}缺 sysctl 命令且自动安装失败，无法关闭 IPv6${NC}"
+        echo -e "  ${YELLOW}没有它就读不到原始值，改了也无法回退，因此不做改动${NC}"
+        echo -e "  ${YELLOW}手动补装后重试（包名: procps-ng / procps）${NC}"
+        pause_return
+        return 1
+    fi
+
+    # 本内核/命名空间压根没有 IPv6 时无事可做。写个不生效的文件只会让状态位在
+    # 「未关闭」上打转（判定读运行时值，而这里永远读不到），用户反复点也没反应
+    if [ ! -d /proc/sys/net/ipv6 ]; then
+        echo -e "\n  ${GREEN}本内核没有 IPv6 支持（/proc/sys/net/ipv6 不存在），无需关闭${NC}"
+        echo -e "  ${YELLOW}未做任何改动${NC}"
+        pause_return
+        return 0
+    fi
+
+    # --- 失联防护闸（全部 fail-closed）---
+    # [人工决策-2026-08-16 22:31:43] 信息不全时一律拒绝，不给 y/N。
+    # 旧写法在「缺 ip 命令 / SSH_CONNECTION 被 tmux 丢掉」时 fail-open，
+    # 恰恰是仅 IPv6 管理的机器最容易撞上的组合，会把唯一通路关死且无法自救。
+    # 探测工具是硬前提：没有 ip 就证明不了「关掉后还能连上」
+    if ! command -v ip >/dev/null 2>&1; then
+        ensure_tools ip >/dev/null
+    fi
+    if ! command -v ip >/dev/null 2>&1; then
+        echo -e "\n  ${RED}拒绝执行：缺 ip 命令，无法确认 IPv4 管理通路是否存在${NC}"
+        echo -e "  ${YELLOW}本项关掉 IPv6 后若没有可用的 IPv4 通路即失联，探测不了就不做。${NC}"
+        echo -e "  ${YELLOW}手动补装后重试（包名: iproute2 / iproute）${NC}"
+        pause_return
+        return 1
+    fi
+
+    # SSH 闸：明确 v6 → 拒；明确 v4 → 过；未知 → 查活跃 v6 SSH，再要求证明 IPv4 通路
+    local _ssh_af
+    ssh_session_af
+    _ssh_af=$?
+    if [ "$_ssh_af" = "0" ]; then
+        local _ssh_conn
+        _ssh_conn=$(resolve_ssh_connection 2>/dev/null || true)
+        echo -e "\n  ${RED}拒绝执行：当前 SSH 会话是通过 IPv6 连进来的${NC}"
+        [ -n "$_ssh_conn" ] && echo -e "  ${RED}  $_ssh_conn${NC}"
+        echo -e "  ${YELLOW}关掉 IPv6 会立刻切断这条连接，且无法从面板恢复。${NC}"
+        echo -e "  ${YELLOW}请改用 IPv4 登录后再执行本项。${NC}"
+        pause_return
+        return 1
+    fi
+    if [ "$_ssh_af" = "2" ]; then
+        # 拿不到 SSH_CONNECTION（控制台 / tmux 丢环境）
+        if has_active_ipv6_ssh; then
+            echo -e "\n  ${RED}拒绝执行：检测到本机有已建立的 IPv6 SSH 连接${NC}"
+            echo -e "  ${YELLOW}当前环境读不到 SSH_CONNECTION，但 ss 显示有人正通过 IPv6 连着 22 端口。${NC}"
+            echo -e "  ${YELLOW}关掉 IPv6 会切断那些会话。请改用 IPv4 登录后再执行。${NC}"
+            pause_return
+            return 1
+        fi
+        if ! has_ipv4_default_route || ! egress_has_ipv4; then
+            echo -e "\n  ${RED}拒绝执行：无法确认当前会话的管理通路${NC}"
+            echo -e "  ${YELLOW}SSH_CONNECTION 为空（常见于 screen/tmux），且没有可用的 IPv4 默认路由/出口地址。${NC}"
+            echo -e "  ${YELLOW}信息不全时不做这个会切断管理通路的操作。请用 IPv4 直连（不要套 tmux）再试。${NC}"
+            pause_return
+            return 1
+        fi
+    fi
+
+    if has_ipv6_default_route && ! has_ipv4_default_route; then
+        echo -e "\n  ${RED}拒绝执行：本机有 IPv6 默认路由但没有 IPv4 默认路由${NC}"
+        echo -e "  ${YELLOW}关掉 IPv6 后这台机器将没有任何默认出口，等于断网。${NC}"
+        echo -e "  ${YELLOW}排查: ip -4 route show default（应有一条 default via ...）${NC}"
+        pause_return
+        return 1
+    fi
+    if ! has_ipv4_default_route; then
+        echo -e "\n  ${RED}拒绝执行：本机没有 IPv4 默认路由${NC}"
+        echo -e "  ${YELLOW}关掉 IPv6 后可能没有任何默认出口。${NC}"
+        echo -e "  ${YELLOW}排查: ip -4 route show default${NC}"
+        pause_return
+        return 1
+    fi
+    if ! egress_has_ipv4; then
+        echo -e "\n  ${RED}拒绝执行：出口网卡 $(egress_dev) 上没有 IPv4 地址${NC}"
+        echo -e "  ${YELLOW}关掉 IPv6 后这台机器将无法通信。${NC}"
+        echo -e "  ${YELLOW}排查: ip -4 addr show dev $(egress_dev)${NC}"
+        pause_return
+        return 1
+    fi
+
+    # 监听 :: 的服务只警告不拒绝：属「服务可能起不来」，可回退，由用户判断。
+    # 关 lo 的 ::1 是用户明确要求的，而绑 ::1 的本地服务最容易在这里出问题，所以列清楚
+    local listeners
+    listeners=$(ipv6_listeners)
+    if [ -n "$listeners" ]; then
+        echo -e "\n  ${YELLOW}以下服务当前在监听 IPv6，关闭后它们的 IPv6 监听会消失${NC}"
+        echo -e "  ${YELLOW}（只监听 :: 的服务可能启动失败，绑 ::1 的本地连接会断）:${NC}"
+        echo -e "${YELLOW}$(wrap_keys "$(printf '%s' "$listeners" | tr '\n' ' ')")${NC}"
+    elif ! command -v ss >/dev/null 2>&1; then
+        echo -e "\n  ${YELLOW}无 ss 命令，无法列出监听 IPv6 的服务（不影响关闭本身）${NC}"
+    fi
+
+    echo -e "\n  将写入 $IPV6_OPT 并立即生效："
+    local k
+    for k in $IPV6_KEYS; do
+        echo -e "    ${CYAN}$k = 1${NC}"
+    done
+    echo -e "  ${CYAN}回退：再进菜单 i（关闭后该键变成「恢复 IPv6」），或菜单 6 连同全部优化一起回退${NC}"
+    read -p "  确认关闭 IPv6？[y/N]: " _c
+    [[ "$_c" =~ ^[Yy]$ ]] || {
+        echo -e "${GREEN}已取消。${NC}"
+        pause_return
+        return 0
+    }
+
+    # 改运行时值前必须先快照，否则回退时没有原值可还原
+    save_original_values || { pause_return; return 1; }
+    ensure_sysctl_dir || { pause_return; return 1; }
+
+    # 与菜单 3 同口径：写入前先说清哪些 key 在本环境设不了（容器命名空间外常见），
+    # 只报告不阻断——配置文件仍要落地，宿主放开权限后重启即生效
+    sysctl_precheck "$IPV6_KEYS"
+
+    # 接管别处设过 disable_ipv6 的文件：只按 IPv6 那组正则接管，不牵连内核调优参数
+    takeover_conflicts "$IPV6_OWNED_RE" "$IPV6_OPT"
+
+    refuse_if_symlink "$IPV6_OPT" || { pause_return; return 1; }
+    if ! cat >"$IPV6_OPT" <<EOF
+# ==================================================
+# 由 tcpo v${SCRIPT_VERSION} 生成于 $(date '+%F %T')
+#
+# 关闭 IPv6 协议族。用途：上游按 IPv6 出口做拦截时让流量只走 IPv4。
+# 与 IPv4 优先解析（gai.conf）的区别：那个只改解析顺序，自带解析器的程序不认；
+# 这个直接关掉协议族，对所有程序一致生效。
+#
+# 三项都写：all 管已存在的接口，default 管之后新建的接口（含容器 veth），
+# lo 连本机 ::1 一起关。绑 ::1 的本地服务会连不上，这是关 lo 的已知代价。
+# 回退: 运行 tcpo 选菜单 i（此时该键显示「恢复 IPv6」），或菜单 6 连同全部优化一起回退。
+# 两者都会删除本文件并把三个 key 写回首次运行前的原始值
+# ==================================================
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+    then
+        echo -e "  ${RED}写入 $IPV6_OPT 失败（磁盘满 / 只读挂载 / 权限），IPv6 未关闭${NC}"
+        pause_return
+        return 1
+    fi
+
+    apply_sysctl
+
+    draw_line
+    local v miss=0
+    for k in $IPV6_KEYS; do
+        v=$(sysctl -n "$k" 2>/dev/null)
+        if [ "$v" = "1" ]; then
+            printf "  ${GREEN}✓${NC} %-40s = %s\n" "$k" "$v"
+        else
+            printf "  ${RED}✗${NC} %-40s = %s\n" "$k" "${v:-读不到}"
+            miss=$((miss + 1))
+        fi
+    done
+    draw_line
+
+    if [ "$miss" -eq 0 ]; then
+        echo -e "${GREEN}完成：IPv6 已关闭${NC}"
+        # 关掉后接口上的 v6 地址会被撤掉，回读一次给用户看实际结果
+        if command -v ip >/dev/null 2>&1; then
+            local left
+            left=$(ip -6 -o addr show scope global 2>/dev/null | wc -l | tr -d ' ')
+            echo -e "  当前剩余全局 IPv6 地址: ${CYAN}${left}${NC} 个"
+        fi
+        report_ipv6_persist
+    else
+        echo -e "${RED}有 $miss 项未生效${NC}"
+        if [ "$DRYRUN" = "1" ]; then
+            echo -e "  ${CYAN}[演练] 未生效是因为跳过了 sysctl --system，真实执行时会生效${NC}"
+        elif is_container; then
+            echo -e "  ${YELLOW}容器环境: net.ipv6.conf.* 可能在命名空间外，需在宿主上设置${NC}"
+        else
+            echo -e "  ${YELLOW}排查: grep -rn disable_ipv6 /etc/sysctl.d/ /etc/sysctl.conf 或看 $APPLY_LOG${NC}"
+        fi
+    fi
+    pause_return
+}
+
+# 单独还原 IPv6（菜单 i 在已开启时提供的关闭入口）。
+# 与菜单 6 的差别只在范围：只删本项的文件、只写回本项那三个 key，不碰其他优化
+restore_ipv6() {
+    echo -e "\n${YELLOW}>>> 重新启用 IPv6${NC}"
+    # 与 disable_ipv6 同一前提：没有 sysctl 就写不回运行时值，只删文件不算恢复
+    # （sysctl --system 对已删除的 key 什么都不做）
+    ensure_tools sysctl >/dev/null
+    if ! command -v sysctl >/dev/null 2>&1; then
+        echo -e "  ${RED}缺 sysctl 命令且自动安装失败，无法写回原值${NC}"
+        echo -e "  ${YELLOW}只删配置文件不等于恢复，因此不做改动；手动补装后重试（procps-ng / procps）${NC}"
+        pause_return
+        return 1
+    fi
+    read -p "  确认恢复 IPv6？[y/N]: " _c
+    [[ "$_c" =~ ^[Yy]$ ]] || {
+        echo -e "${GREEN}已取消。${NC}"
+        pause_return
+        return 0
+    }
+    rm -f "$IPV6_OPT"
+    # [人工决策-2026-08-16 22:31:43] 关闭时 takeover_conflicts 会把用户原文件里的
+    # disable_ipv6 行注释掉。只删 $IPV6_OPT 不解开那些注释 = 用户原配置永久失效，
+    # 「按一次 i 再按一次 i」回不到菜单 i 执行前的真实状态。
+    # 只解开归属本项（owner=$IPV6_OPT）的标记，不动菜单 3/4 接管的其他参数
+    # [人工决策-2026-08-16 22:49:27] 接管解开 / apply / 写回 任一失败都不能报「已恢复」。
+    # 旧写法只看 ipv6_disabled_now：运行时被写成 0 就报成功，即使用户原配置行仍是
+    # 注释——重启后 sysctl.d 里没有生效的 disable_ipv6=0，语义仍是坏的
+    local ok=1
+    restore_ipv6_takeovers || ok=0
+    # 顺序与菜单 6 一致：先 --system 让还留着的/刚解开的文件重新生效，再逐个写回快照值。
+    # 反过来做的话 --system 会覆盖刚写回的值
+    apply_sysctl || {
+        echo -e "  ${RED}应用 sysctl 失败，运行时值可能未还原${NC}"
+        ok=0
+    }
+    restore_ipv6_keys || ok=0
+    draw_line
+    local k v
+    for k in $IPV6_KEYS; do
+        v=$(sysctl -n "$k" 2>/dev/null)
+        printf "  %-40s = %s\n" "$k" "${v:-读不到}"
+    done
+    draw_line
+    if [ "$ok" = "1" ] && ! ipv6_disabled_now; then
+        echo -e "${GREEN}完成：IPv6 已恢复${NC}"
+        echo -e "  ${YELLOW}接口上的 IPv6 地址由 SLAAC/DHCPv6 重新获取，可能需要几秒${NC}"
+    else
+        echo -e "${RED}恢复未完整${NC}"
+        if ipv6_disabled_now; then
+            echo -e "  ${RED}运行时 IPv6 仍处于关闭状态${NC}"
+            echo -e "  ${YELLOW}排查: grep -rn disable_ipv6 /etc/sysctl.d/ /etc/sysctl.conf${NC}"
+            echo -e "  ${YELLOW}（可能有别的配置文件也在设它，本面板只管自己写的那份）${NC}"
+        fi
+        if grep -rslF "# moved to ${IPV6_OPT} by tcp-dashboard:" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null |
+            grep -q .; then
+            echo -e "  ${RED}仍有文件残留 IPv6 接管标记（用户原配置未解开）${NC}"
+            echo -e "  ${YELLOW}手动: grep -rn 'moved to.*zz-disable-ipv6' /etc/sysctl.d/ /etc/sysctl.conf${NC}"
+        fi
+        echo -e "  ${YELLOW}修好后重跑菜单 i（恢复）${NC}"
+    fi
+    pause_return
+    [ "$ok" = "1" ] && ! ipv6_disabled_now
+}
+
+# 解开菜单 i 关闭时留下的接管标记。
+# 标记格式由 comment_out_conflicts 写：`# moved to <owner> by tcp-dashboard: <原行>`
+# 只匹配 owner=$IPV6_OPT 的行，避免把菜单 3 注释掉的 somaxconn 之类一并解开。
+# 用字面量前缀剥离而不是 sed 正则：owner 是路径，含 / . 等，sed 转义极易漏
+# 返回 0=全部解开（或本来就没有）、1=有文件解不开/仍有残留
+restore_ipv6_takeovers() {
+    local f n=0 failed=0 prefix tmp line
+    prefix="# moved to ${IPV6_OPT} by tcp-dashboard: "
+    for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+        [ -f "$f" ] || continue
+        grep -qF "$prefix" "$f" 2>/dev/null || continue
+        tmp="${f}.tcpdash.tmp"
+        if ! {
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                "$prefix"*) printf '%s\n' "${line#"$prefix"}" ;;
+                *) printf '%s\n' "$line" ;;
+                esac
+            done <"$f"
+        } >"$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            echo -e "  ${RED}解开 $f 里的 IPv6 接管标记失败（只读挂载 / 权限）${NC}"
+            echo -e "  ${YELLOW}手动处理: 把该文件里「$prefix」前缀去掉${NC}"
+            failed=1
+            continue
+        fi
+        if ! cat "$tmp" >"$f" 2>/dev/null; then
+            rm -f "$tmp"
+            echo -e "  ${RED}写回 $f 失败（只读挂载 / 权限）${NC}"
+            echo -e "  ${YELLOW}手动处理: 把该文件里「$prefix」前缀去掉${NC}"
+            failed=1
+            continue
+        fi
+        rm -f "$tmp"
+        if grep -qF "$prefix" "$f" 2>/dev/null; then
+            echo -e "  ${RED}写回后 $f 里仍有 IPv6 接管标记${NC}"
+            echo -e "  ${YELLOW}手动处理: 把该文件里「$prefix」前缀去掉${NC}"
+            failed=1
+            continue
+        fi
+        n=$((n + 1))
+        echo -e "  已解开 $f 里的 IPv6 接管标记"
+    done
+    [ "$n" -gt 0 ] && echo -e "  共恢复 ${GREEN}$n${NC} 个文件里被菜单 i 注释掉的原配置"
+    # 兜底：任何残留都算失败（上面某条路径漏计 failed 时也能抓住）
+    if grep -rslF "$prefix" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null | grep -q .; then
+        failed=1
+    fi
+    [ "$failed" = "0" ]
+}
+
+# 把三个 IPv6 key 写回快照原值。与 restore_managed_keys 同一套口径：
+# ABSENT 表示本内核/命名空间没这个 key，跳过；读不到快照也跳过，绝不用硬编码默认值兜底
+restore_ipv6_keys() {
+    local k v restored=0 skipped=0
+    if ! command -v sysctl >/dev/null 2>&1; then
+        echo -e "  ${RED}缺 sysctl 命令，无法写回 IPv6 运行时值${NC}"
+        return 1
+    fi
+    for k in $IPV6_KEYS; do
+        v=$(orig_value "$k") || { skipped=$((skipped + 1)); continue; }
+        [ "$v" = "ABSENT" ] && { skipped=$((skipped + 1)); continue; }
+        if [ "$DRYRUN" = "1" ]; then
+            skipped=$((skipped + 1))
+        elif sysctl -w "$k=$v" &>/dev/null; then
+            restored=$((restored + 1))
+        else
+            skipped=$((skipped + 1))
+        fi
+    done
+    echo -e "  已还原 ${GREEN}${restored}${NC} 项运行时值（$skipped 项不可写或原本不存在，已跳过）"
+    [ "$restored" -gt 0 ] || [ "$skipped" -gt 0 ]
+}
+
+# IPv6 关闭的持久化结论。复用 report_sysctl_persist 会连带打印 BBR 模块提示
+# （那与本项无关，会让用户以为关 IPv6 还要管 tcp_bbr），所以单独判一次同样的三态
+report_ipv6_persist() {
+    if has_systemd; then
+        echo -e "  ${GREEN}已持久化 ($IPV6_OPT)${NC}"
+        return 0
+    fi
+    if sysctl_apply_ran_at_boot; then
+        if write_sysctl_apply; then
+            echo -e "  ${GREEN}本次已生效${NC} | 开机重放脚本有运行痕迹（只是运行痕迹，请重启确认）"
+            wsl_boot_hint_verify
+            return 0
+        fi
+        echo -e "  ${RED}开机重放脚本 $SYSCTL_APPLY 写入失败，重启后 IPv6 会恢复${NC}"
+        return 1
+    fi
+    if sysctl_replay_ok; then
+        echo -e "  ${GREEN}已持久化 ($IPV6_OPT)${NC}（由系统自带的 sysctl 服务重放，非本面板的脚本）"
+        return 0
+    fi
+    echo -e "  ${YELLOW}本次已生效，但重启后 IPv6 会恢复${NC}"
+    if is_container; then
+        echo -e "  ${YELLOW}本机是容器，开机不会重放 /etc/sysctl.d/，持久化请在宿主上设置或用 docker run --sysctl${NC}"
+        return 1
+    fi
+    echo -e "  ${YELLOW}本机没有 systemd，开机不会有人读 /etc/sysctl.d/${NC}"
+    write_sysctl_apply || return 1
+    echo -e "  ${GREEN}已生成 $SYSCTL_APPLY${NC}"
+    wsl_boot_hint
+    return 1
 }
 
 # ==================================================
@@ -1782,8 +2270,7 @@ EOF
 # ==================================================
 enable_bbr() {
     echo -e "\n${YELLOW}>>> 开启 BBR + FQ${NC}"
-    # 这里就会改运行时值，必须先快照——否则用户只跑菜单 2 再回退，
-    # 就没有原值可还原了。快照失败必须中止：没有快照的回退等于猜
+    # 改运行时值前必须先快照，否则回退时没有原值可还原
     save_original_values || { pause_return; return 1; }
 
     # 部分发行版 BBR 是模块，未加载时 available 列表里没有 bbr，直接写 sysctl 会静默失败
@@ -1809,8 +2296,7 @@ enable_bbr() {
 
     ensure_sysctl_dir || { pause_return; return 1; }
     refuse_if_symlink "$BBR_OPT" || { pause_return; return 1; }
-    # 查返回值：写失败后继续 apply_sysctl 是在应用一份没落地的配置，
-    # 而面板会照常打印「BBR 已生效」。项目原则「落地类操作必须查返回值再宣布成功」
+    # 查返回值，避免写失败后仍误报「BBR 已生效」
     if ! cat >"$BBR_OPT" <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -1820,8 +2306,7 @@ EOF
         pause_return
         return 1
     fi
-    # 走统一入口，别裸跑 sysctl --system：内核拒绝的原因（模块没加载、算法名不存在、
-    # 被后加载文件覆盖）必须回显给用户，否则失败时只看到「当前仍为 cubic」而查不出为什么
+    # 走统一入口而非裸跑 sysctl --system，以便回显内核拒绝的具体原因
     apply_sysctl
 
     local cur_cc cur_qdisc
@@ -1834,21 +2319,16 @@ EOF
     draw_line
     if [ "$cur_cc" = "bbr" ]; then
         echo -e "${GREEN}完成：BBR 已生效${NC}$(bbr_version_label)"
-        # 「本次生效」与「开机还生效」是两件事，必须分开报。无 systemd 的机器上
-        # /etc/sysctl.d 与 /etc/modules-load.d 开机都没人读，重启后回到 cubic
+        # 「本次生效」与「开机还生效」分开报，无 systemd 机器重启后会回到 cubic
         report_sysctl_persist "$BBR_OPT"
     else
         echo -e "${RED}未生效：当前仍为 $cur_cc${NC}"
-        # 分情况给具体线索，不要笼统说「可能不支持」
         local avail
         avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
         if [ -n "$avail" ] && ! printf '%s' "$avail" | grep -qw bbr; then
-            echo -e "  ${YELLOW}可用算法里没有 bbr（当前: $avail）。内核需 4.9+，且 tcp_bbr 模块要能加载${NC}"
-            echo -e "  ${YELLOW}排查: modprobe tcp_bbr 看报什么；容器内通常无法加载内核模块${NC}"
+            echo -e "  ${YELLOW}可用算法无 bbr（需 4.9+，排查: modprobe tcp_bbr；容器内通常无法加载）${NC}"
         else
-            echo -e "  ${YELLOW}bbr 在可用列表里但没生效，说明被别的配置覆盖了。排查:${NC}"
-            echo -e "  ${YELLOW}    grep -rn tcp_congestion_control /etc/sysctl.d/ /etc/sysctl.conf${NC}"
-            echo -e "  ${YELLOW}    上面 sysctl 的报错和 $APPLY_LOG${NC}"
+            echo -e "  ${YELLOW}bbr 在列表但被覆盖: grep -rn tcp_congestion_control /etc/sysctl.d/ /etc/sysctl.conf${NC}"
         fi
     fi
     pause_return
@@ -1857,20 +2337,22 @@ EOF
 # ==================================================
 # --- 3. 内核参数调优 ---
 # ==================================================
-# 本脚本负责的 key。zz- 前缀只能赢过字典序在它之前的文件，遇到 zzz-*.conf 或
-# /etc/sysctl.d/ 里被别的面板写的同名 key 依然会被盖。逐项校验能「发现」被覆盖，
-# 接管才能「阻止」——把命中这些 key 的其它文件备份后移走，并把清单落盘供回退还原
-OWNED_KEYS_RE='^[[:space:]]*net\.(core\.(default_qdisc|somaxconn|netdev_max_backlog|netdev_budget|netdev_budget_usecs|rmem_max|wmem_max|rps_sock_flow_entries)|ipv4\.(tcp_congestion_control|tcp_max_syn_backlog|tcp_syncookies|ip_local_port_range|ip_local_reserved_ports|tcp_rmem|tcp_wmem|tcp_notsent_lowat|tcp_mtu_probing|udp_rmem_min|tcp_slow_start_after_idle|tcp_no_metrics_save|tcp_tw_reuse|tcp_fin_timeout|tcp_fastopen|ip_forward))[[:space:]]*='
+# 本脚本负责的 key。zz- 前缀只赢字典序在前的文件，仍可能被 zzz-*.conf 等同名 key 覆盖，
+# 需靠接管阻止（备份命中文件、注释冲突行、清单落盘供回退）
+OWNED_KEYS_RE='^[[:space:]]*(net\.(core\.(default_qdisc|somaxconn|netdev_max_backlog|netdev_budget|netdev_budget_usecs|rmem_max|wmem_max|rps_sock_flow_entries)|ipv4\.(tcp_congestion_control|tcp_max_syn_backlog|tcp_syncookies|ip_local_port_range|ip_local_reserved_ports|tcp_rmem|tcp_wmem|tcp_notsent_lowat|tcp_mtu_probing|udp_rmem_min|tcp_slow_start_after_idle|tcp_no_metrics_save|tcp_tw_reuse|tcp_fin_timeout|tcp_fastopen|ip_forward))|fs\.nr_open)[[:space:]]*='
 
-# 把一个文件里命中受管 key 的行注释掉，其余行原样保留。
-# 关键点：只动冲突的那几行，不整文件禁用。发行版和安全加固包常把多个不相关的参数
-# 放在同一个 .conf 里（比如 10-network-security.conf 同时有 rp_filter、accept_redirects
-# 和一个我们要管的 key），整文件 mv 走会把那些无关的安全参数一起停掉——那是行为回归，
-# 不是「接管冲突」
+# 关闭 IPv6 的接管正则，与 $IPV6_KEYS 必须覆盖同一组参数。
+# 单列一份而不是并进 OWNED_KEYS_RE：菜单 3/4 不该因为「有人在别的文件里设过 IPv6」
+# 就去注释那些行——它们与内核调优无关，只有菜单 i 才有资格接管
+IPV6_OWNED_RE='^[[:space:]]*net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*='
+
+# 把一个文件里命中受管 key 的行注释掉，其余行原样保留。只动冲突行不整文件禁用，
+# 否则会连带停掉同文件里无关的安全参数（如 10-network-security.conf 里的 rp_filter）。
+# 正则与归属文件可传入，供菜单 i 用自己那一组（默认是内核调优那一组）
 comment_out_conflicts() {
-    local target=$1 tmp
+    local target=$1 re=${2:-$OWNED_KEYS_RE} owner=${3:-$SYSCTL_OPT} tmp
     tmp="${target}.tcpdash.tmp"
-    awk -v re="$OWNED_KEYS_RE" -v owner="$SYSCTL_OPT" '
+    awk -v re="$re" -v owner="$owner" '
         $0 ~ re && $0 !~ /^[[:space:]]*#/ {
             print "# moved to " owner " by tcp-dashboard: " $0
             next
@@ -1884,9 +2366,11 @@ comment_out_conflicts() {
 }
 
 # 接管 /etc/sysctl.d 下与本脚本冲突的文件，以及 /etc/sysctl.conf 里的冲突行。
-# 一律「逐行注释 + 备份原文件」，不移动、不禁用整个文件
+# 一律「逐行注释 + 备份原文件」，不移动、不禁用整个文件。
+# 可传入 <正则> <归属文件> 只接管某一组参数（菜单 i 传自己那组），默认是内核调优那组
 takeover_conflicts() {
     mkdir -p "$STATE_DIR"
+    local re=${1:-$OWNED_KEYS_RE} owner=${2:-$SYSCTL_OPT}
     local ts backup_dir moved=0 f base
     ts=$(date '+%Y%m%d-%H%M%S')
     backup_dir="$STATE_DIR/takeover-$ts"
@@ -1894,33 +2378,29 @@ takeover_conflicts() {
     for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
         [ -f "$f" ] || continue
         base=$(basename "$f")
-        # 跳过自己、BBR 子文件、RFS 子文件，以及备份/禁用/说明类文件
+        # 跳过自己/BBR/RFS/IPv6 子文件及备份、禁用、说明类文件
         case "$base" in
-        "$(basename "$SYSCTL_OPT")" | "$(basename "$BBR_OPT")" | "$(basename "$NIC_SYSCTL_OPT")") continue ;;
+        "$(basename "$SYSCTL_OPT")" | "$(basename "$BBR_OPT")" | "$(basename "$NIC_SYSCTL_OPT")" | "$(basename "$IPV6_OPT")") continue ;;
         *.bak | *.bak.* | *.disabled | *.disabled.* | *.old | README*) continue ;;
         esac
-        grep -qE "$OWNED_KEYS_RE" "$f" 2>/dev/null || continue
+        grep -qE "$re" "$f" 2>/dev/null || continue
 
         mkdir -p "$backup_dir"
-        # 备份文件名带路径信息，避免 /etc/sysctl.conf 与 /etc/sysctl.d/sysctl.conf 撞名。
-        # 备份失败就不接管：回退是靠这份备份整份还原的，没备份成功就改原文件
-        # 等于制造一个不可逆的改动——「可回退性」优先于「参数生效」
+        # 备份文件名带路径信息防止撞名；备份失败就不接管，避免制造不可回退的改动
         if ! cp -a "$f" "$backup_dir/$(echo "${f#/}" | tr '/' '_')" 2>/dev/null; then
             echo -e "  ${RED}备份 $f 失败，跳过接管（不做无法回退的改动）${NC}"
             echo -e "  ${YELLOW}该文件里的同名参数可能仍会覆盖本脚本的设置${NC}"
             continue
         fi
-        if comment_out_conflicts "$f"; then
+        if comment_out_conflicts "$f" "$re" "$owner"; then
             atomic_append "$TAKEOVER_LIST" "$f"
-            echo -e "  ${YELLOW}已注释 $f 里的冲突行（该文件其余参数不受影响）${NC}"
             moved=$((moved + 1))
         else
             echo -e "  ${RED}无法改写 $f（只读挂载？），它可能仍会覆盖本脚本的参数${NC}"
         fi
     done
 
-    # 上一版把冲突文件整体改名为 .disabled-by-tcp-dashboard，会连带停掉无关参数。
-    # 遇到那种遗留就改回来，再走逐行注释
+    # 旧版整文件改名为 .disabled-by-tcp-dashboard 的遗留，改回来后走逐行注释
     for f in /etc/sysctl.d/*.disabled-by-tcp-dashboard; do
         [ -f "$f" ] || continue
         local orig="${f%.disabled-by-tcp-dashboard}"
@@ -1928,9 +2408,9 @@ takeover_conflicts() {
             mv "$f" "$orig" 2>/dev/null && {
                 echo -e "  ${YELLOW}发现旧版整文件禁用的遗留，已还原 $orig 并改为逐行注释${NC}"
                 mkdir -p "$backup_dir"
-                # 同上：备份失败就不接管，不制造无法回退的改动
+                # 同上：备份失败就不接管
                 if cp -a "$orig" "$backup_dir/$(echo "${orig#/}" | tr '/' '_')" 2>/dev/null; then
-                    comment_out_conflicts "$orig" && {
+                    comment_out_conflicts "$orig" "$re" "$owner" && {
                         grep -qxF "$orig" "$TAKEOVER_LIST" 2>/dev/null || atomic_append "$TAKEOVER_LIST" "$orig"
                         moved=$((moved + 1))
                     }
@@ -1941,53 +2421,37 @@ takeover_conflicts() {
         fi
     done
 
-    [ "$moved" -gt 0 ] && echo -e "  ${GREEN}接管 $moved 处，原文件备份在 $backup_dir，回退时整份还原${NC}"
+    [ "$moved" -gt 0 ] && echo -e "  ${GREEN}接管 $moved 处冲突（备份在 $backup_dir）${NC}"
 
-    report_vendor_conflicts
+    report_vendor_conflicts "$re"
     return 0
 }
 
-# 报告 /etc 之外的目录里也设了同名参数的文件。只报告，不接管。
-#
-# systemd-sysctl 读四个目录：/etc/sysctl.d、/run/sysctl.d、/usr/local/lib/sysctl.d、
-# /usr/lib/sysctl.d（部分发行版 /lib 是 /usr/lib 的符号链接），外加 /etc/sysctl.conf。
-#
-# 这里要说清一个容易搞错的点：sysctl.d(5) 原文是「All configuration files are sorted by
-# their filename in lexicographic order, **regardless of which of the directories they
-# reside in**」——跨目录一起按文件名排序，字典序最后的赢。目录优先级只在**同名文件**
-# 之间起作用（/etc 里的同名文件整份替换 /usr/lib 里的）。
-# 所以本脚本的 zz- 前缀在任何目录面前都是最后加载的，vendor 文件不会覆盖它。
-#
-# 那为什么还要报告？因为用户需要知道「同一个参数还有别处在设」：
-#   1) 删掉本脚本的文件后，那些值会重新生效——回退后的状态不是发行版原始状态；
-#   2) 排查「为什么值和我想的不一样」时，得知道完整的来源清单。
-# 不接管 /usr/lib 与 /lib：那是包管理器的领地，改了会在下次升级时被覆盖，
-# 且用户无从知晓。/run 是易失的（重启即空），改它没意义
+# 报告 /etc 之外目录里设了同名参数的文件，只报告不接管。
+# sysctl.d(5)：所有目录的配置文件统一按文件名字典序排序，最后的赢，所以本脚本的 zz-
+# 前缀不会被 vendor 文件覆盖；但删掉本脚本文件后那些值会重新生效，且排查时需要完整来源，
+# 故仍报告。不接管 /usr/lib 与 /lib（包管理器领地，升级会覆盖），/run 易失改它无意义
 report_vendor_conflicts() {
+    local re=${1:-$OWNED_KEYS_RE}
     local d f hits="" n=0
     for d in /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
         [ -d "$d" ] || continue
         for f in "$d"/*.conf; do
             [ -f "$f" ] || continue
-            # /lib 常是 /usr/lib 的符号链接，同一份文件会被数两次
+            # /lib 常是 /usr/lib 的符号链接，去重防止重复计数
             case " $hits " in *" $(readlink -f "$f" 2>/dev/null || echo "$f") "*) continue ;; esac
-            grep -qE "$OWNED_KEYS_RE" "$f" 2>/dev/null || continue
+            grep -qE "$re" "$f" 2>/dev/null || continue
             hits="$hits $(readlink -f "$f" 2>/dev/null || echo "$f")"
             n=$((n + 1))
         done
     done
     [ "$n" -eq 0 ] && return 0
-    echo -e "  ${YELLOW}另有 $n 个系统目录下的文件也设了本脚本管理的参数：${NC}"
-    for f in $hits; do echo -e "    ${YELLOW}$f${NC}"; done
-    echo -e "  ${YELLOW}它们不会覆盖本脚本（zz- 前缀在跨目录字典序里最后加载），故不接管——${NC}"
-    echo -e "  ${YELLOW}那些目录属包管理器所有，改动会在升级时被静默覆盖。${NC}"
-    echo -e "  ${YELLOW}但要知道：回退删掉本脚本的文件后，上面这些值会重新生效${NC}"
+    echo -e "  ${YELLOW}另有 $n 处系统目录设了同名参数（不影响，zz- 优先）${NC}"
     return 0
 }
 
-# 扫当前监听端口，把落在临时端口范围内的合并成区间写进 ip_local_reserved_ports。
-# 这是放宽 ip_local_port_range 的正解：内核分配随机源端口时会跳过保留区间，
-# 业务服务重启时就不会撞上「端口已被某条出站连接占用」
+# 扫当前监听端口，合并成区间写进 ip_local_reserved_ports，让内核分配随机源端口时
+# 跳过它们，避免放宽 ip_local_port_range 后业务重启撞端口
 build_reserved_ports() {
     local lo=$1 hi=$2
     if ! command -v ss >/dev/null 2>&1; then
@@ -1996,7 +2460,7 @@ build_reserved_ports() {
     fi
     ss -HtulnA all 2>/dev/null | awk -v lo="$lo" -v hi="$hi" '
         {
-            # 取本地地址列（形如 0.0.0.0:8080 / [::]:443 / *:53），端口是最后一个冒号之后
+            # 取本地地址列，端口在最后一个冒号之后
             for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) { addr = $i; break }
             if (addr == "") next
             n = split(addr, a, ":"); p = a[n] + 0
@@ -2023,11 +2487,8 @@ build_reserved_ports() {
         }'
 }
 
-# 按带宽 x RTT 算缓冲区上限（BDP），而不是拍内存百分比。
-# 内存百分比是代理指标：同一台 2G 内存的机器，跑 1Gbps/10ms 的同城线和 100Mbps/250ms 的
-# 跨境线，需要的窗口差 20 倍，但按内存算会得到同一个值。
-# 公式：BDP(bytes) = Mbps x 125 x RTT_ms，取 2.5 倍留给丢包重传期间的在途数据。
-# 上限同时受内存约束（不超过总内存 5%），下限 8MB。
+# 按带宽 x RTT 算缓冲区上限（BDP），而非按内存百分比（同内存不同 RTT 需求差可达 20 倍）。
+# 公式：BDP(bytes) = Mbps x 125 x RTT_ms，取 2.5 倍余量；同时受内存 5% 约束，下限 8MB
 calc_buf_bytes() {
     local mbps=$1 rtt=$2 mem_total_kb=$3 pool_bytes=${4:-0}
     local bdp buf mem_cap pool_cap
@@ -2035,29 +2496,21 @@ calc_buf_bytes() {
     buf=$((bdp * 5 / 2))
     mem_cap=$((mem_total_kb * 5 / 100 * 1024))
     [ "$buf" -gt "$mem_cap" ] && buf=$mem_cap
-    # 第四道约束：TCP 全局内存池。
-    # rmem_max 是「单条连接的上限」，但所有连接共用 net.ipv4.tcp_mem[2] 这个全局池
-    # （单位是页）。池被打满时内核进入内存压力模式，强制收缩**所有**连接的缓冲——
-    # 那时 rmem_max 设多大都没意义，反而因为单条连接吃得多而更早触发。
-    # 实测量级：512MB 内存机器的池约 48MB，而 BDP 算出的 47MB 意味着一条满载连接
-    # 就能打满它。所以把单条上限压到「池 / 预期并发数」以内。
-    # 取 16 作除数是保守估计：跨境代理/中转机同时跑几十条连接是常态，
-    # 但真要按几十算会把缓冲压得太小、失去 BDP 的意义，16 是折中。
-    # 池读不到（容器里 tcp_mem 常不可读）时传 0，本约束自动跳过——
-    # 不猜一个池大小，猜错要么白白限制要么起不到作用
+    # 第四道约束：TCP 全局内存池（net.ipv4.tcp_mem[2]，单位页）。池打满时内核会强制收缩
+    # 所有连接的缓冲，所以单条上限要压到「池/预期并发数」以内，除数 16 是跨境多连接场景的折中。
+    # 池读不到（容器常见）时传 0，本约束跳过，不猜一个可能错的池大小
     if [ "${pool_bytes:-0}" -gt 0 ] 2>/dev/null; then
         pool_cap=$((pool_bytes / 16))
         [ "$buf" -gt "$pool_cap" ] && buf=$pool_cap
     fi
     [ "$buf" -lt 8388608 ] && buf=8388608
     [ "$buf" -gt 268435456 ] && buf=268435456
-    # 向上取整到 MB，让 sysctl 里的数字好读
+    # 向上取整到 MB
     echo $(((buf + 1048575) / 1048576 * 1048576))
 }
 
-# 读 tcp_mem 的第三个字段（max，单位是页）并换成字节。读不到回 0。
-# 只读不写：本项目「故意不设」tcp_mem（ESnet 原话 leave net.tcp_mem at its defaults，
-# 且社区脚本大面积把页当字节写出过 256GB 这种值），但读它来给缓冲区加一道上界是安全的
+# 读 tcp_mem 第三字段（max，页）换算成字节，读不到回 0。只读不写：
+# 本项目故意不设 tcp_mem（社区脚本常把页当字节写出离谱大值），但读它加一道上界是安全的
 tcp_mem_pool_bytes() {
     local v pg hi
     v=$(sysctl -n net.ipv4.tcp_mem 2>/dev/null) || { echo 0; return; }
@@ -2069,7 +2522,7 @@ tcp_mem_pool_bytes() {
     esac
     pg=$(getconf PAGESIZE 2>/dev/null)
     case "$pg" in '' | *[!0-9]*) pg=4096 ;; esac
-    # 页数 × 页大小可能超过 32 位，但 bash 算术是 64 位，安全
+    # bash 算术是 64 位，页数x页大小不会溢出
     echo $((hi * pg))
 }
 
@@ -2088,13 +2541,8 @@ probe_rtt() {
     echo "$best"
 }
 
-# 出口网卡的链路速率（Mbps）。读不到或不可信时回 0。
-#
-# 用途是给用户输入的带宽做个上界提示——填 10000 但网卡是 1000 时值得说一声，
-# 因为带宽直接决定 BDP 与缓冲区大小，填错一个数量级会让缓冲区大一个数量级。
-# 不用它当默认值：物理口速率 ≠ 可用带宽，跨境 VPS 常见千兆口但实际跑不到百兆，
-# 拿口速当默认值会系统性高估。
-# 虚拟网卡（virtio / veth）常返回 -1 或读取直接报错，那种情况回 0 让调用方跳过
+# 出口网卡链路速率（Mbps），读不到或不可信回 0。只用于给用户输入的带宽做上界提示，
+# 不当默认值：物理口速率不等于可用带宽，拿它当默认会系统性高估。虚拟网卡常返回 -1，同样回 0
 nic_link_mbps() {
     local dev=$1 v
     [ -n "$dev" ] || return 0
@@ -2112,22 +2560,14 @@ nic_link_mbps() {
     echo "$v"
 }
 
-# RTT 抖动（ping 的 mdev 字段，即平均偏差）。输出 "目标 avg mdev"，每个目标一行。
-#
-# 为什么要单独取 mdev：抖动比均值更能说明链路质量，而调优的收益也常体现在抖动上。
-# 有个很好的公开对照（nginx reuseport 那组数据）：延迟均值只从 15.65ms 降到 12.35ms
-# （-21%），但标准差从 26.59 降到 3.15（-88%）——只看均值会几乎错过全部收益。
-# 菜单 a 的结尾一直写着「抖动下降往往比均值提升更有价值」，但在此之前没有任何数字支撑它。
-#
-# ping 的汇总行是 min/avg/max/mdev，$5 是 avg、$7 是 mdev（$6 是 max）。
-# mdev 是平均绝对偏差不是标准差，量级相近、方向一致，作为抖动指标够用且零成本
+# RTT 抖动（ping 的 mdev 字段），输出 "目标 avg mdev"。抖动比均值更能说明链路质量与
+# 调优收益（nginx reuseport 案例：均值仅降 21%，标准差降 88%）。mdev 是平均绝对偏差非标准差，
+# 量级相近方向一致，作抖动指标够用且零成本
 probe_jitter() {
     command -v ping >/dev/null 2>&1 || return 1
     local t line avg mdev
     for t in $RTT_PROBE_TARGETS; do
-        # 汇总行形如 "rtt min/avg/max/mdev = 52.789/52.943/53.244/0.163 ms"。
-        # 按 / 切之后最后一个字段带着单位（"0.163 ms"），所以在 awk 里就用 split 去掉尾巴，
-        # 不能直接拿 $7——那样会连 " ms" 一起带出来，后面的数值校验必然失败
+        # 最后字段带单位（"0.163 ms"），用 split 去掉尾巴，直接取 $7 会带上 " ms" 导致校验失败
         line=$(ping -c 5 -W 2 -q "$t" 2>/dev/null | awk -F'/' '
             /rtt|round-trip/ {
                 n = split($NF, a, " ")
@@ -2164,14 +2604,13 @@ tune_sysctl() {
     echo -e "\n${YELLOW}>>> 部署内核网络参数（档位: ${CYAN}${PROFILE}${YELLOW}）${NC}"
 
     mbps=$TUNE_MBPS
-    # RTT 的来源要记下来：它直接决定缓冲区大小，而「实测 152ms」和「探测失败按 150 猜」
-    # 是完全不同的置信度。三个月后回头看配置文件时这一点最容易忘
+    # 记录 RTT 来源（实测/估算），置信度不同，配置文件要留痕
     local rtt_src=""
     rtt=$TUNE_RTT
     if [ -n "$rtt" ]; then
         rtt_src="(外部指定)"
     else
-        # RTT 直接决定缓冲区大小，探不到就只能按典型值猜，所以缺 ping 时先装
+        # RTT 直接决定缓冲区大小，缺 ping 时先装
         ensure_tools ping >/dev/null
         echo -e "  正在探测 RTT ..."
         rtt=$(probe_rtt)
@@ -2187,22 +2626,10 @@ tune_sysctl() {
         if [ "$BATCH" = "1" ]; then
             mbps=1000
         else
-            # 先把网卡链路速率报出来当参考。不拿它当默认值——物理口速率不等于
-            # 可用带宽，跨境 VPS 常见千兆口而实际跑不到百兆，当默认值会系统性高估
-            local link_mbps
-            link_mbps=$(nic_link_mbps "$(egress_dev)")
-            [ "${link_mbps:-0}" -gt 0 ] 2>/dev/null &&
-                echo -e "  参考：出口网卡链路速率 ${CYAN}${link_mbps}${NC} Mbps（实际可用带宽通常低于此值）"
             read -p "  本机出口带宽 Mbps（回车默认 1000）: " mbps
             case "$mbps" in
             '' | *[!0-9]*) mbps=1000 ;;
             esac
-            # 填得比物理口还高时提示一次。不阻止——用户可能就是想按聚合带宽算，
-            # 或者 /sys 里的 speed 本身不准（虚拟网卡常见）
-            if [ "${link_mbps:-0}" -gt 0 ] 2>/dev/null && [ "$mbps" -gt "$link_mbps" ] 2>/dev/null; then
-                echo -e "  ${YELLOW}提示：${mbps} Mbps 高于网卡链路速率 ${link_mbps} Mbps。${NC}"
-                echo -e "  ${YELLOW}      带宽直接决定缓冲区大小，填大一个数量级缓冲区就大一个数量级${NC}"
-            fi
         fi
     fi
     [ "$mbps" -lt 1 ] 2>/dev/null || [ -z "$mbps" ] && mbps=1000
@@ -2213,8 +2640,7 @@ tune_sysctl() {
     bdp_bytes=$((mbps * 125 * rtt))
     raw_target=$((bdp_bytes * 5 / 2))
 
-    # 说清最终值是被哪一道约束定下来的。用户最常问的就是「为什么是 24MB」，
-    # 而答案可能是四种完全不同的原因，只显示结果等于让人自己猜
+    # 说清最终值被哪道约束定下来，避免用户只看到结果自己猜原因
     if [ "$buf_bytes" -eq 8388608 ] && [ "$raw_target" -lt 8388608 ]; then
         cap_reason="下限 8MB（BDP 推导值 $((raw_target / 1048576))MB 偏小）"
     elif [ "$buf_bytes" -eq 268435456 ]; then
@@ -2240,45 +2666,40 @@ tune_sysctl() {
     fi
 
     echo -e "  CPU: ${CYAN}${cpu_count}${NC} 核 | 内存: ${CYAN}$((mem_total_kb / 1024))${NC} MB"
-    echo -e "  带宽: ${CYAN}${mbps}${NC} Mbps | RTT: ${CYAN}${rtt}${NC} ms ${rtt_src} | BDP: ${CYAN}$((bdp_bytes / 1048576))${NC} MB"
-    echo -e "  缓冲区上限: ${CYAN}$((buf_bytes / 1024 / 1024))${NC} MB  <- ${cap_reason}"
-    if [ "$pool_bytes" -gt 0 ]; then
-        echo -e "    TCP 全局池 (tcp_mem 上限): $((pool_bytes / 1048576)) MB，按本值可容纳约 $((pool_bytes / buf_bytes)) 条满载连接"
-    fi
+    echo -e "  带宽: ${CYAN}${mbps}${NC} Mbps | RTT: ${CYAN}${rtt}${NC} ms ${rtt_src}"
+    echo -e "  缓冲区上限: ${CYAN}$((buf_bytes / 1024 / 1024))${NC} MB"
 
     ensure_sysctl_dir || { pause_return; return 1; }
 
-    # 写入前先说清哪些 key 在本环境根本设不了，免得用户看完一屏"已写入"再去
-    # verify 那段才发现一堆没生效。中转档的 ip_forward 也在受管清单里，一并预检
+    # 写入前先说清哪些 key 在本环境设不了；中转档的 ip_forward 也在受管清单里一并预检
     sysctl_precheck "$MANAGED_KEYS"
 
-    # 清掉旧版写的 99- 文件，避免两份配置并存（值不同时按字典序谁后加载谁赢，排查起来很坑）
+    # 清掉旧版写的 99- 文件，避免两份配置按字典序互相覆盖
     rm -f "$LEGACY_SYSCTL_OPT"
 
     takeover_conflicts
 
     # 容量类参数取 max(内核现值, 目标值)，避免在内核默认值更高的机器上反向调低
-    local v_somax v_backlog v_rmem_max v_wmem_max v_rmem3 v_wmem3 reserved
+    local v_somax v_backlog v_rmem_max v_wmem_max v_rmem3 v_wmem3 reserved v_nr_open
     v_somax=$(sysctl_ceil net.core.somaxconn 65535)
     v_backlog=$(sysctl_ceil net.core.netdev_max_backlog 65535)
     v_rmem_max=$(sysctl_ceil net.core.rmem_max "$buf_bytes")
     v_wmem_max=$(sysctl_ceil net.core.wmem_max "$buf_bytes")
     v_rmem3=$(sysctl_ceil3 net.ipv4.tcp_rmem 4096 131072 "$buf_bytes")
     v_wmem3=$(sysctl_ceil3 net.ipv4.tcp_wmem 4096 16384 "$buf_bytes")
-    # 保留端口要靠 ss 扫监听状态。缺了会导致放宽端口范围后业务端口可能被随机源端口占用，
-    # 所以这里要装而不是静默跳过
+    # fd 数硬顶，是 limits.d/systemd nofile 的前提，硬限超过它 setrlimit 会被拒绝
+    v_nr_open=$(sysctl_ceil fs.nr_open 1048576)
+    # 保留端口要靠 ss 扫监听状态，缺了会导致业务端口被随机源端口占用，需要装而非跳过
     ensure_tools ss >/dev/null
     reserved=$(build_reserved_ports 32768 65535)
 
     refuse_if_symlink "$SYSCTL_OPT" || { pause_return; return 1; }
-    # 主配置写失败必须中止：后面会 apply_sysctl 并报「配置持久化于 ...」，
-    # 那时用户以为参数已经落地，而文件根本是空的或半截的
+    # 主配置写失败必须中止，避免后续误报持久化成功
     if ! cat >"$SYSCTL_OPT" <<EOF
 # ==================================================
 # 由 tcpo v${SCRIPT_VERSION} 生成于 $(date '+%F %T')，档位 ${PROFILE}
 #
-# 缓冲区推导链（记下来是因为「为什么是这个数」三个月后没人记得，
-# 而重新跑一遍未必得到同样的值——RTT 是实测的、内核默认值也会变）：
+# 缓冲区推导链（RTT 是实测的，重跑不一定得到同样的值）：
 #   带宽        ${mbps} Mbps${link_note}
 #   RTT         ${rtt} ms ${rtt_src}
 #   BDP         ${mbps} x 125 x ${rtt} = $((bdp_bytes / 1048576)) MB
@@ -2298,24 +2719,19 @@ net.ipv4.tcp_congestion_control = bbr
 # --- 连接容量（取 max(内核现值, 目标值)，不在默认值更高的机器上反向调低）---
 net.core.somaxconn = ${v_somax}
 net.core.netdev_max_backlog = ${v_backlog}
-# 注意：现代内核里这个值不再决定 SYN 队列长度。inet_csk_reqsk_queue_is_full() 比的是
-# sk_max_ack_backlog，它来自 listen() 的 backlog 参数、被 somaxconn 钳住。本参数如今只在
-# syncookies 关闭时用于保留末 1/4 队列给「证明存活过」的对端。要真正放大半连接队列，
-# 得让应用把 listen() backlog 传大（如 nginx listen ... backlog=）。
+# 现代内核里此值不再决定 SYN 队列长度（那由 listen() backlog 经 somaxconn 钳住），
+# 仅在 syncookies 关闭时保留末 1/4 队列
 net.ipv4.tcp_max_syn_backlog = 16384
-# SYN 洪泛时降级为无状态握手。内核默认已是 1，但常被各类面板脚本关掉，显式写回
+# SYN 洪泛降级为无状态握手，内核默认已是 1，防止被面板脚本关掉
 net.ipv4.tcp_syncookies = 1
 
 # --- 软中断收包预算（NAPI 单次轮询上限，内核默认 300 / 2000）---
-# 抬高可减少高 PPS 下的 squeeze。是否真有收益看 /proc/net/softnet_stat 第 3 列有无增长，
-# 菜单「诊断」会读这个数；若长期为 0 则本机不需要这两项
+# 抬高减少高 PPS 下的 squeeze，收益看 /proc/net/softnet_stat 第 3 列（诊断菜单可读）
 net.core.netdev_budget = 600
 net.core.netdev_budget_usecs = 8000
 
-# 出站随机源端口范围。不要从 1024 起：1024-32767 之间有大量服务默认端口
-# (MySQL 3306 / Redis 6379 / PostgreSQL 5432 / 各类业务端口)，随机源端口一旦占用，
-# 该服务重启时 bind 会失败报 Address already in use，概率低但极难归因。
-# 下面的 ip_local_reserved_ports 会把当前监听中、且落在本范围内的端口排除掉。
+# 出站随机源端口范围。不从 1024 起，避开常见服务默认端口，防止占用导致重启 bind 失败。
+# 下面 ip_local_reserved_ports 会排除当前监听中落在本范围内的端口
 net.ipv4.ip_local_port_range = 32768 65535
 $(if [ -n "$reserved" ]; then
         echo "# 自动保留：以下端口在本次调优时处于监听状态且落在临时端口范围内，"
@@ -2326,45 +2742,37 @@ $(if [ -n "$reserved" ]; then
         echo "# 未检测到落在 32768-65535 内的监听端口，无需保留（ip_local_reserved_ports 留空）"
     fi)
 
-# --- 缓冲区（第三个值是上限，内核按需增长，不是预分配）---
-# 中间值是新建 socket 的初始缓冲，不是上限。取值依据：
-#   rmem 131072 —— 现代内核默认值（红帽 RHEL-25847 专门把 87380 抬到这里）。
-#                   社区脚本普遍抄的 87380 是 2.6 时代的老默认值，写它等于把初始接收窗口往回压。
-#   wmem 16384  —— 内核默认值，红帽 network-throughput / openshift 两个 profile 同值。
-#                   发送缓冲有自动调优，把初值设大只会让每条连接起步多占内存；
-#                   且下面已设 tcp_notsent_lowat 压住未发送队列，抬高初值没有对应收益。
+# --- 缓冲区（第三个值是上限，内核按需增长，非预分配）---
+# 中间值是新建 socket 初始缓冲：rmem 131072 是现代内核默认值（社区常抄的 87380 是老值，
+# 会压低初始接收窗口）；wmem 16384 是内核/红帽 profile 默认值，发送侧有自动调优不需抬高
 net.core.rmem_max = ${v_rmem_max}
 net.core.wmem_max = ${v_wmem_max}
 net.ipv4.tcp_rmem = ${v_rmem3}
 net.ipv4.tcp_wmem = ${v_wmem3}
 
 # --- 跨境链路针对性 ---
-# 限制未发送队列积压。取 128K 而非社区常见的 16K：16384 的出处是 Cloudflare 那篇
-# HTTP/2 优先级文章，场景是 nginx 直接服务浏览器、要让高优先级响应尽快插队；
-# 长肥网络转发是另一回事——写侧留太少会让每写一小块就等一次 epoll 唤醒，高 RTT 下出现空隙。
-# 131072 是红帽 openshift profile 的取值，Cloudflare 高吞吐篇实测 466ms RTT 仍跑满 1Gbps
+# 限制未发送队列积压，取 128K 而非社区常见的 16K（那是 Cloudflare 浏览器场景的值，
+# 长肥网络转发写侧留太少会在高 RTT 下出现空隙）。131072 是红帽 openshift profile 的取值
 net.ipv4.tcp_notsent_lowat = 131072
 # MTU 探测，解决部分运营商阻断 ICMP 造成的 PMTU 黑洞
 net.ipv4.tcp_mtu_probing = 1
-# UDP 最小接收缓冲，缓解 QUIC/Hysteria2 高并发丢包。
-# 不设 udp_wmem_min——内核文档原文「UDP does not have tx memory accounting and this
-# tunable has no effect」，写了不报错也不生效。UDP 发送侧要放大靠 net.core.wmem_max（已设）
-# 加应用自己 setsockopt(SO_SNDBUF)
+# UDP 最小接收缓冲，缓解 QUIC/Hysteria2 高并发丢包。不设 udp_wmem_min——内核文档明写
+# 该项对发送侧无效，UDP 发送侧放大靠 net.core.wmem_max + 应用自己 setsockopt(SO_SNDBUF)
 net.ipv4.udp_rmem_min = 16384
 # 长连接空闲后不退回慢启动（对 SSE / 长轮询 / 视频流有效）
 net.ipv4.tcp_slow_start_after_idle = 0
-# 不把上次连接的 ssthresh/cwnd 缓存进路由 metrics。默认 0 会让跨境链路晚高峰一次拥塞留下的
-# 低 ssthresh 被同一目的地址后续所有连接继承，表现为「刚才卡过之后一直上不去速」
+# 不缓存 ssthresh/cwnd 进路由 metrics，避免跨境链路一次拥塞的低 ssthresh 被后续连接继承
 net.ipv4.tcp_no_metrics_save = 1
 
 # --- 连接回收 ---
-# 不设 tcp_max_orphans——内核文档明写「you must not rely on this or lower the limit
-# artificially, but rather increase it」，默认值 ehash_entries/2 随内存自动伸缩，
-# 2GB 以上机器通常已超过社区常写的 32768，写死反而是在降低它；而本脚本把 wmem_max 抬到了
-# 数十 MB，每个 orphan 最坏能吃一个 wmem 上限，固定 orphan 数的账算不出来
+# 不设 tcp_max_orphans：内核文档要求只升不降，默认值随内存自动伸缩，写死反而是降低它
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_fastopen = 3
+
+# --- 文件句柄硬顶 ---
+# 单进程 fd 数绝对上限，是 limits.d 与 systemd DefaultLimitNOFILE 的前提，同样取 max(现值,目标值)
+fs.nr_open = ${v_nr_open}
 
 $(if [ "$PROFILE" = "transit" ]; then
         echo "# --- 中转档专属：本机要为别的流量做转发 ---"
@@ -2382,53 +2790,25 @@ $(if [ "$PROFILE" = "transit" ]; then
 # net.ipv4.tcp_retries2 = 8
 
 # ==================================================
-# 以下是「故意不设」的参数，社区脚本普遍在写，但对本场景无效或有害。
-# 记录理由是为了防止后续版本把有意的省略当成遗漏「补上」。
+# 以下是「故意不设」的参数，防止后续版本把有意的省略当成遗漏「补上」。
 # ==================================================
-# tcp_mem / udp_mem   单位是页不是字节，社区脚本大面积搞错（见过写出 256GB 的）。
-#                     内核按空闲内存自动分三档，ESnet 原话 leave net.tcp_mem at its defaults；
-#                     红帽曾专门提交 commit 删掉显式 udp_mem，理由是没考虑用户内存大小
-# tcp_adv_win_scale   6.6 起内核文档标注 Obsolete，已换成 per-socket 的 scaling_ratio
-#                     （按 skb->len/skb->truesize 实测），唯一消费者不再读取该字段。
-#                     能写入、不报错、完全无效。社区还在抄的 -2 在 6.6+ 上已失去意义
-# tcp_tw_recycle      4.12 起从内核删除，写了 sysctl --system 会报 unknown key。
-#                     删除前也有害：按对端 IP 记时间戳，NAT 后多客户端会被误判丢 SYN
-# tcp_fack            5.4 起内核文档：this is a legacy option, it has no effect anymore
-# tcp_low_latency     4.14 起同上，一字不差
+# tcp_mem / udp_mem   单位是页非字节，社区脚本常搞错；内核按内存自动分档，ESnet 建议保持默认
+# tcp_adv_win_scale   6.6 起 Obsolete，已被 per-socket scaling_ratio 取代，写了不生效
+# tcp_tw_recycle      4.12 起已从内核删除，且删除前会因 NAT 环境误判丢包
+# tcp_fack            5.4 起内核文档标注 legacy，无效果
+# tcp_low_latency     4.14 起同上
 # ipfrag_low_thresh   4.17 起标注 Obsolete
-# tcp_max_tw_buckets  文档同样写 must not lower artificially。社区常写的 5000 会让超限的
-#                     TIME_WAIT socket 被立即销毁，等于绕过 TIME_WAIT 语义、人为制造
-#                     RFC1337 风险，只为让 ss | wc -l 的数字好看
+# tcp_max_tw_buckets  文档要求只升不降，社区常写的 5000 会绕过 TIME_WAIT 语义制造 RFC1337 风险
 # tcp_sack / tcp_dsack / tcp_timestamps / tcp_window_scaling
-#                     硬化类脚本为省 CPU 或防指纹把它们设 0，对长肥网络是灾难：没有 SACK
-#                     一次丢包只能靠累积确认恢复，没有时间戳 PAWS 和 RTT 估计都失效，
-#                     关掉窗口缩放等于把窗口锁在 64KB。ESnet 明确反对为 WAN 关闭它们
-# rp_filter           是安全项不是性能项，且 all 设 1 后无法在单个接口降回
-#                     （内核取 conf/{all,interface} 的较大值）。代理机常有多网卡 / WireGuard /
-#                     策略路由的非对称回程，设 1 会静默丢包。取值取决于用户的路由拓扑，
-#                     不该由通用脚本代做决定
-# tcp_rfc1337         同为安全项。内核默认 0 时本来就有 TIME_WAIT assassination 防护，
-#                     设 1 会丢弃 TIME_WAIT 状态的 RST，代理机遇到对端异常重置时要多等一个
-#                     完整 TIME_WAIT
-# busy_poll/busy_read 用满核 CPU 换微秒级延迟。跨境链路的瓶颈是 RTT 不是本机中断，
-#                     VPS 上烧 CPU 有直接成本。红帽只在 network-latency profile 里设它，
-#                     network-throughput 一个字都没有
+#                     硬化脚本常关掉这些换性能，但长肥网络离不开 SACK/PAWS/窗口缩放，ESnet 反对关闭
+# rp_filter           安全项非性能项，all=1 后单接口无法降回，多网卡/非对称路由场景会静默丢包
+# tcp_rfc1337         安全项，默认 0 已有防护，设 1 会让代理机异常重置时多等一个 TIME_WAIT
+# busy_poll/busy_read 用 CPU 换微秒级延迟，跨境瓶颈是 RTT 不是本机中断，红帽仅 latency profile 用
 # rmem_default / wmem_default
-#                     这是每 socket 的默认值而非上限，抬高对 UDP 尤其浪费（每个 socket
-#                     实打实占用）。上限交给 rmem_max/wmem_max，初始值交给 tcp_rmem/tcp_wmem
-# optmem_max          社区普遍写 65536，但内核文档说默认是 128KB（net.rst 原文
-#                     "Maximum ancillary buffer size allowed per socket"，Default: 128 KB）。
-#                     这个默认值随内核版本变过，写死 65536 在新内核上是往下调。
-#                     而且它管的是 cmsg 辅助数据不是收发缓冲，对吞吐没有直接关系
-# initcwnd / initrwnd 内核默认已是 RFC 6928 背书的 IW10，而 RFC 原文明说 10 以上
-#                     "results are mixed" 且不提供支持证据。社区取值 20/30/50/64/100
-#                     全无依据，加大还会抬高初始突发的丢包风险（RFC 自己的实测里
-#                     重传率上升、SlowDC 的尾延迟反而恶化）。另外它写在路由属性上，
-#                     DHCP 续租重装默认路由后会静默失效，要保住得再挂一层 dispatcher 钩子
-# txqueuelen          红帽 tuned 提供了这个 option 但没有任何内置 profile 使用它。
-#                     给出具体数字的权威来源只有 ESnet/OSG 那份，而它的阶梯是给
-#                     10G 起步的专用数据传输节点的。本脚本已用 default_qdisc=fq 做整形、
-#                     用 tcp_notsent_lowat 压未发送队列，再加深发送队列方向相反
+#                     每 socket 默认值非上限，抬高对 UDP 浪费；上限交给 rmem_max/wmem_max
+# optmem_max          内核默认 128KB 非社区常写的 65536，管 cmsg 辅助数据，与吞吐无关
+# initcwnd / initrwnd 内核默认已是 RFC 6928 的 IW10，社区加大值无依据且会抬高丢包风险
+# txqueuelen          红帽 tuned 未在任何内置 profile 用它，权威取值针对 10G 专用节点不适用本场景
 EOF
     then
         echo -e "  ${RED}写入 $SYSCTL_OPT 失败（磁盘满 / 只读挂载 / 权限），内核参数未配置${NC}"
@@ -2440,23 +2820,48 @@ EOF
     apply_sysctl
 
     # 句柄上限的硬顶是 fs.nr_open，超过它 setrlimit 会被内核拒绝（实测报
-    # "Operation not permitted"）。所以目标值要取 min(想要的, nr_open)——
-    # 社区脚本普遍写死 1048576 或更大而不看 nr_open，在 nr_open 较低的内核上
-    # 会让 limits.conf 整行失效（PAM 报错但用户看不到）
+    # "Operation not permitted"）。社区脚本普遍写死 1048576 而不看 nr_open，
+    # 在 nr_open 较低的内核上会让 limits.conf 整行失效（PAM 报错但用户看不到）。
+    #
+    # [人工决策-2026-08-06 15:05:56] 处置从「取 min(想要的, nr_open) 往下砍」改为
+    # 「把 nr_open 本身抬上去」。判例：Docker Desktop / WSL2 场景下 fs.nr_open 被
+    # 别的东西降到 65536 时，旧写法把这个瞬时值烙进 limits.d 与 systemd drop-in，
+    # 于是 DefaultLimitNOFILE 从发行版默认 1024:524288 被降成 2048:65536——
+    # 本脚本成了「降低句柄上限」的那一方，而 ClickHouse 这类要求 nofile=262144 的
+    # 容器直接起不来（runc 报 error setting rlimit type 7: operation not permitted）。
+    # 同一台机器上另一个发行版因为运行时刻不同写出了 1048576，差 16 倍。
+    #
+    # 两点必须同时成立才对：
+    #   1) nr_open 是可写的运行时 sysctl，抬它与抬 somaxconn 是同一类动作，
+    #      归入受管清单后可被 save_original_values 快照、被菜单 6 完整还原；
+    #   2) 即使抬不动（容器内 /proc/sys/fs 只读），也绝不低于机器现状——
+    #      与 sysctl_ceil 的「只升不降」口径统一。旧写法在这里是单向下调，
+    #      与同一个函数里 somaxconn 的处理自相矛盾。
+    #
+    # fs.nr_open 已写进主配置（$v_nr_open）并由上面的 apply_sysctl 生效，这里回读
+    # 实际值而不是复用 $v_nr_open：抬不动时（容器内 /proc/sys/fs 只读、演练模式跳过
+    # 了 sysctl --system）生效值仍是旧的，据实取才不会写出一个内核会拒绝的硬限
     local nofile_want=1048576 nr_open
     nr_open=$(sysctl -n fs.nr_open 2>/dev/null)
     case "$nr_open" in
-    '' | *[!0-9]*) nr_open=1048576 ;;
+    '' | *[!0-9]*) nr_open=$nofile_want ;;
     esac
     [ "$nofile_want" -gt "$nr_open" ] && nofile_want=$nr_open
+    # 棘轮保护：不低于当前已生效的合法 systemd 硬限，本脚本只做「抬高」这一个方向
+    local cur_hard
+    cur_hard=$(systemctl show -p DefaultLimitNOFILE --value 2>/dev/null)
+    case "$cur_hard" in
+    '' | *[!0-9]*) cur_hard=0 ;;
+    esac
+    [ "$cur_hard" -gt "$nofile_want" ] && [ "$cur_hard" -le "$nr_open" ] && nofile_want=$cur_hard
 
     mkdir -p /etc/security/limits.d/
-    # 句柄上限不是核心网络参数，是链接就跳过这一项、其余照做（不像 sysctl 主配置
-    # 那样中止整个菜单）。严重度分级：核心参数写不了要停，附属项写不了只提示
+    # 句柄上限是附属项，是链接就跳过这一项、其余照做，不中止整个菜单
     if refuse_if_symlink "$LIMITS_OPT"; then
         if ! cat >"$LIMITS_OPT" <<EOF
-# 由 tcp-dashboard 写入。nofile 取 min(1048576, fs.nr_open=${nr_open})——
-# 硬限超过 fs.nr_open 时 setrlimit 会被内核拒绝，整行静默失效
+# 由 tcpo 写入。nofile=${nofile_want}，受 fs.nr_open=${nr_open} 约束
+# （硬限超过 fs.nr_open 时 setrlimit 会被内核拒绝、整行静默失效）。
+# nr_open 本身也由 tcpo 抬到 1048576 并写进 $SYSCTL_OPT，不再被它往下限制
 * soft nofile ${nofile_want}
 * hard nofile ${nofile_want}
 * soft nproc 65535
@@ -2465,47 +2870,31 @@ root soft nofile ${nofile_want}
 root hard nofile ${nofile_want}
 EOF
         then
-            # 句柄上限是附属项，写不成只提示、其余照做（与上面链接分支同一处置）
+            # 写不成只提示，不中止
             echo -e "  ${YELLOW}写入 $LIMITS_OPT 失败，句柄上限未改动${NC}"
         fi
     else
         echo -e "  ${YELLOW}跳过 limits.d（见上），句柄上限未改动${NC}"
     fi
 
-    # limits.d 只走 PAM，systemd 启动的服务不经过 PAM——而 xray / nginx / sing-box
-    # 这些最需要高 fd 的进程恰恰都是 systemd 服务。它们的上限来自 systemd 的
-    # DefaultLimitNOFILE（unit 里没显式写 LimitNOFILE 时）。
-    #
-    # 写法参照 CachyOS 官方设置的 usr/lib/systemd/system.conf.d/10-limits.conf：
-    # 用「软:硬」两段式而不是把软限也拉满——软限拉满会让那些按 RLIMIT_NOFILE 大小
-    # 预分配 fd 表的老程序吃掉大量内存（select() 的 FD_SETSIZE 问题同源）。
-    # 软限留小、让需要的进程自己 setrlimit 抬到硬限，是 systemd 自己的默认策略。
-    # 硬限同样受 fs.nr_open 约束
+    # limits.d 只走 PAM，systemd 服务的上限来自 DefaultLimitNOFILE。写法参照 CachyOS
+    # 官方 10-limits.conf：软限留小避免老程序按 RLIMIT_NOFILE 预分配 fd 表吃内存，硬限受 nr_open 约束
     if has_systemd; then
         if mkdir -p "$(dirname "$SYSTEMD_LIMITS_OPT")" 2>/dev/null &&
             printf '[Manager]\nDefaultLimitNOFILE=2048:%s\n' "$nofile_want" |
             atomic_write "$SYSTEMD_LIMITS_OPT"; then
-            echo -e "  已写 systemd 全局句柄上限 ${CYAN}2048:${nofile_want}${NC}（$SYSTEMD_LIMITS_OPT）"
-            echo -e "  ${YELLOW}注意：已在运行的服务不受影响。要让它生效：${NC}"
-            echo -e "  ${CYAN}    systemctl daemon-reexec && systemctl restart <你的服务>${NC}"
-            echo -e "  ${YELLOW}  或重启机器。unit 里显式写了 LimitNOFILE 的服务优先级更高，需单独改${NC}"
+            echo -e "  systemd 全局句柄上限 ${CYAN}2048:${nofile_want}${NC}（重启或 daemon-reexec 后生效）"
         else
-            echo -e "  ${YELLOW}systemd 全局句柄上限写入失败，systemd 服务的 fd 上限未改动${NC}"
+            echo -e "  ${YELLOW}systemd 全局句柄上限写入失败${NC}"
         fi
-    else
-        echo -e "  ${YELLOW}本机不由 systemd 管理，跳过 systemd 全局句柄上限${NC}"
     fi
 
-    # MSS clamp 只在中转档加。理由：
-    #   1) 它的作用对象是「经过本机转发」的 TCP 连接，普通业务机没有这类流量，加了是空规则；
-    #   2) 本机自己发起/接收的连接由已设的 tcp_mtu_probing 处理，功能重叠；
-    #   3) 规则挂 FORWARD 链而非原来的 POSTROUTING——POSTROUTING 在 mangle 表虽然也能改到
-    #      转发包，但同时会碰到本机 OUTPUT 出去的包，语义不清；FORWARD 才是转发路径的专用链
+    # MSS clamp 只在中转档加：只对转发流量有意义，本机连接已有 tcp_mtu_probing 处理；
+    # 挂 FORWARD 链而非 POSTROUTING，避免语义混到本机 OUTPUT 的包
     if [ "$PROFILE" = "transit" ]; then
-        # 中转档必须有 iptables，缺了就装（RHEL/Fedora/openSUSE/Alpine 的最小化安装都不自带）
+        # 中转档必须有 iptables，缺了就装（多个发行版最小化安装不自带）
         if ensure_tools iptables >/dev/null; then
-            # 先清掉本脚本以前加的（含旧版无 comment 的），再加带 comment 的新规则。
-            # 不能只靠精确文本匹配删除——见 del_owned_mss 的说明
+            # 先清掉旧规则（含无 comment 版本）再加新规则，细节见 del_owned_mss
             del_owned_mss >/dev/null
             if dryrun_skip "iptables -t mangle -A FORWARD ... TCPMSS --clamp-mss-to-pmtu"; then
                 :
@@ -2515,8 +2904,7 @@ EOF
                 echo -e "  ${YELLOW}iptables 规则重启即失效，要持久化请装 iptables-persistent 并 netfilter-persistent save${NC}"
             elif iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN \
                 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-                # comment 模块（xt_comment）在极简内核上可能缺失，降级到无标记规则。
-                # 代价是回退时只能靠精确文本匹配，与用户自己加的同款规则无法区分
+                # xt_comment 缺失时降级到无标记规则，回退时只能靠精确文本匹配
                 echo -e "${GREEN}  已加 MSS Clamp 规则到 mangle FORWARD${NC}"
                 echo -e "  ${YELLOW}本机缺 xt_comment 模块，规则未带所有权标记；回退时若你自己也加过同样的规则，可能一并删掉${NC}"
             else
@@ -2532,8 +2920,7 @@ EOF
     draw_line
     printf "  %-12s: %-14s -> %s\n" "拥塞算法" "$old_cc" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
     printf "  %-12s: %-14s -> %s\n" "somaxconn" "$old_somax" "$(sysctl -n net.core.somaxconn 2>/dev/null)"
-    # 读不到就显示「不可读」而不是 0MB——容器里 net.core.* 不在命名空间内，
-    # 显示 0MB 会让人以为参数被清零了
+    # 读不到显示「不可读」而非 0MB，避免误以为参数被清零
     local new_rmem
     new_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
     if [ -n "$new_rmem" ]; then
@@ -2544,21 +2931,14 @@ EOF
     draw_line
 
     verify_sysctl_applied
-    # 先逐条校验「本次是否生效」，再报「开机还会不会生效」。两件事分开说：
-    # 无 systemd 的机器上前者全绿、后者是不会，混成一句「已持久化」就是假报成功
+    # 「本次生效」与「开机还生效」分开报，避免无 systemd 机器被误报持久化成功
     report_sysctl_persist "$SYSCTL_OPT"
 
-    echo -e "  ${YELLOW}注意：limits.d 只对登录 shell 生效；systemd 服务已由上面的 DefaultLimitNOFILE 覆盖。${NC}"
-    echo -e "  ${YELLOW}      Docker 容器内的进程更是完全不受宿主 limits 影响（要改得用 docker run --ulimit）${NC}"
     pause_return
 }
 
-# 逐项比对「配置文件里写的」与「sysctl 实际生效的」，每行输出一条判定，
-# 字段用 TAB 分隔：<OK|BAD|ABSENT>\t<key>\t<期望>\t<实际>
-# 分隔符必须是 TAB 而不是空格：tcp_rmem/tcp_wmem/ip_local_port_range 的值本身带空格，
-# 按空格切会把三元组切碎（曾用 "[want] [got]" 格式，${rest% *} 在三元组上取出半截值）
-# 提成独立函数是因为主菜单的状态标记也要用同一份判据——两处各写一遍比较逻辑，
-# 迟早漂成「详情页说没生效、菜单显示已开启」
+# 逐项比对「配置文件里写的」与「sysctl 实际生效的」，输出 <OK|BAD|ABSENT>\t<key>\t<期望>\t<实际>。
+# 分隔符用 TAB 而非空格：部分值本身带空格会被切碎。提成独立函数供主菜单共用同一份判据
 sysctl_diff_lines() {
     local conf=$1 key want got line
     [ -f "$conf" ] || return 0
@@ -2569,8 +2949,7 @@ sysctl_diff_lines() {
         key=$(echo "$key" | tr -d ' \t')
         want=$(echo "$want" | tr -s ' \t' ' ' | sed 's/^ //;s/ $//')
         [ -z "$key" ] && continue
-        # 空串是 ip_local_reserved_ports 的合法值，所以判「读不到」只能看退出码，
-        # 不能看值是否为空（AGENTS.md 记过这个判例）
+        # 空串是合法值（如 ip_local_reserved_ports），判「读不到」只能看退出码
         if ! got=$(sysctl -n "$key" 2>/dev/null); then
             printf 'ABSENT\t%s\t%s\t\n' "$key" "$want"
             continue
@@ -2584,25 +2963,17 @@ sysctl_diff_lines() {
     done <"$conf"
 }
 
-# 配置文件里有没有「写了但没生效」的项（只数 BAD，ABSENT 不算——容器里读不到属正常）。
-# 主菜单用它区分「配置在且生效」与「配置在但没生效」，后者正是无 systemd 机器重启后的状态
+# 配置文件里有没有「写了但没生效」的项（只数 BAD，ABSENT 属正常）。
+# 主菜单用它区分「配置在且生效」与「配置在但没生效」（无 systemd 机器重启后的状态）
 sysctl_conf_stale() {
     sysctl_diff_lines "$1" | grep -q '^BAD'
 }
 
-# 写入前预检：这个 key 在本内核到底能不能设。
-# 与 verify_sysctl_applied 的分工是「事前」与「事后」——后者能发现失败，前者能提前
-# 说清原因。三种结果对应三种完全不同的处置：
-#   MISSING 本内核没有这个参数（版本太老、或编译时没开对应 CONFIG）→ 跳过，不是错误
-#   RO      路径在但不可写（非特权 LXC / 只读 /proc / 容器命名空间外）→ 无能为力，如实说
-#   WRITABLE 可写
-# 判据用 /proc/sys 路径而不是 sysctl -n：后者读得到不代表写得进去（容器里 net.core.*
-# 常常可读不可写），而回退依赖「改过什么」的准确记录，猜不得
+# 写入前预检 key 在本内核能不能设：MISSING 不存在（跳过）、RO 不可写、WRITABLE 可写。
+# 用 /proc/sys 路径而非 sysctl -n：后者可读不代表可写
 sysctl_writable() {
     local path
-    # 用 tr 而不是 ${1//./\/}：后者在不同 shell 下对 \/ 的处理不一致（zsh 会把反斜杠
-    # 当字面量留下，得到 net\/core\/rmem_max 这种路径，于是一律判成 MISSING）。
-    # 本脚本虽然是 bash，但这种「换个 shell 就静默全错」的写法不值得留
+    # 用 tr 而非 ${1//./\/}：zsh 下反斜杠处理不一致会导致误判成 MISSING
     path="/proc/sys/$(printf '%s' "$1" | tr '.' '/')"
     if [ ! -e "$path" ]; then
         echo MISSING
@@ -2613,8 +2984,7 @@ sysctl_writable() {
     fi
 }
 
-# 对一份 key 清单做预检并打印汇总。只报告不阻断——即使全部不可写也要把配置文件写下去，
-# 因为用户可能是在容器里为宿主准备配置，或稍后会用特权模式重跑
+# 对一份 key 清单做预检并打印汇总。只报告不阻断，即使全部不可写也要把配置文件写下去
 sysctl_precheck() {
     local keys=$1 k st missing="" ro="" n_ok=0
     for k in $keys; do
@@ -2626,24 +2996,20 @@ sysctl_precheck() {
         esac
     done
     if [ -z "$missing" ] && [ -z "$ro" ]; then
-        echo -e "  写入前预检: ${GREEN}${n_ok} 项全部可写${NC}"
         return 0
     fi
-    echo -e "  写入前预检: ${GREEN}${n_ok}${NC} 项可写"
     if [ -n "$missing" ]; then
-        echo -e "    ${YELLOW}本内核不存在（将被跳过，非错误）:${NC}"
+        echo -e "  ${YELLOW}本内核不存在（跳过）:${NC}"
         echo -e "${YELLOW}$(wrap_keys "$missing")${NC}"
     fi
     if [ -n "$ro" ]; then
-        echo -e "    ${YELLOW}路径存在但不可写（容器命名空间外 / 非特权 LXC）:${NC}"
+        echo -e "  ${YELLOW}不可写（容器命名空间外）:${NC}"
         echo -e "${YELLOW}$(wrap_keys "$ro")${NC}"
-        echo -e "    ${YELLOW}这些项写进配置文件但不会在本环境生效，需在宿主机上设置${NC}"
     fi
     return 0
 }
 
-# 把一串 key 折行成缩进段落。受管清单有二十多项，逐行输出会刷掉半屏。
-# 不用 fmt：它不在 POSIX 必备工具里，busybox 环境常缺（缺了整段输出就没了）
+# 把一串 key 折行成缩进段落，不用 fmt（busybox 环境常缺）
 wrap_keys() {
     printf '%s\n' $1 | awk '
         { if (length(line) + length($1) + 1 > 62) { print "      " line; line = "" }
@@ -2651,8 +3017,7 @@ wrap_keys() {
         END { if (line != "") print "      " line }'
 }
 
-# 写进 /etc/sysctl.d/ 不等于生效——被后加载的文件覆盖、内核不支持该参数、模块没加载，
-# 三种情况都静默失败，sysctl --system 的报错还常被 &>/dev/null 吞掉。
+# 写进配置不等于生效（可能被后加载文件覆盖、内核不支持、模块未加载，均静默失败）。
 # 判例：somaxconn 写了 65535，被发行版自带的 99-sysctl.conf 盖回 1024，无任何提示
 verify_sysctl_applied() {
     local mismatch=0 absent=0 total=0 in_container=0 verdict key want got
@@ -2664,8 +3029,7 @@ verify_sysctl_applied() {
         total=$((total + 1))
         case "$verdict" in
         ABSENT)
-            # 读不到有两种含义：容器里 net.core.* 不在命名空间内（正常），
-            # 或真机上参数名写错/内核太老（要修）。不能算进「全部生效」
+            # 读不到可能是容器命名空间外（正常）或参数名写错/内核太老，不算全部生效
             absent=$((absent + 1))
             [ "$in_container" = "0" ] && echo -e "  ${YELLOW}? $key 本内核无此参数${NC}"
             ;;
@@ -2680,35 +3044,31 @@ EOF
 
     local applied=$((total - mismatch - absent))
     if [ "$mismatch" -gt 0 ]; then
-        echo -e "  ${RED}有 $mismatch 项没真正生效（共 $total 项，已生效 $applied 项）${NC}"
+        echo -e "  ${RED}有 $mismatch 项未生效（共 $total 项）${NC}"
         if [ "$in_container" = "1" ]; then
-            echo -e "  ${YELLOW}检测到容器环境：net.core.* 等多数参数在容器内是只读的，这属正常，不是脚本问题${NC}"
+            echo -e "  ${YELLOW}容器环境: net.core.* 在容器内只读属正常${NC}"
         else
-            echo -e "  ${YELLOW}最常见原因：/etc/sysctl.d/ 里有字典序更靠后的文件覆盖了同名参数。排查：${NC}"
-            echo -e "  ${YELLOW}    grep -rn '<参数名>' /etc/sysctl.d/ /etc/sysctl.conf${NC}"
-            echo -e "  ${YELLOW}    菜单 3 已会自动接管冲突文件，若仍不一致请看 $APPLY_LOG${NC}"
+            echo -e "  ${YELLOW}排查: grep -rn '<参数名>' /etc/sysctl.d/ /etc/sysctl.conf 或看 $APPLY_LOG${NC}"
         fi
     elif [ "$absent" -gt 0 ]; then
         if [ "$in_container" = "1" ]; then
-            echo -e "  ${GREEN}✓ 已生效 $applied 项${NC}${YELLOW}，另有 $absent 项在容器命名空间外（宿主机才有，属正常）${NC}"
+            echo -e "  ${GREEN}✓ $applied 项已生效${NC}（$absent 项容器命名空间外）"
         else
-            echo -e "  ${GREEN}✓ 已生效 $applied 项${NC}${YELLOW}，另有 $absent 项本内核不支持（上面已列出）${NC}"
+            echo -e "  ${GREEN}✓ $applied 项已生效${NC}（$absent 项本内核不支持）"
         fi
     else
-        echo -e "  ${GREEN}✓ 配置项已逐条校验，全部 $total 项实际生效${NC}"
+        echo -e "  ${GREEN}✓ 全部 $total 项已生效${NC}"
     fi
 }
 
 # ==================================================
 # --- 4. 网卡多队列 / RPS ---
 # ==================================================
-# 生成 N 个 CPU 全开的掩码，格式为逗号分隔的 32 位字、高位在前（内核 bitmap 格式）。
-# 不能用 printf '%x' $(((1 << n) - 1))：bash 算术是 64 位，n>=64 时移位溢出得 0
-# （等于关闭 RPS），且 33-63 核算出的连续长十六进制串内核不接受。
-# 实测对照 —— 64 核旧写法得 0、128 核得 0、33 核得 1ffffffff 都是错的
+# 生成 N 个 CPU 全开的掩码，逗号分隔的 32 位字、高位在前（内核 bitmap 格式）。
+# 不能用 printf '%x' $(((1 << n) - 1))：n>=64 时移位溢出得 0，等于关闭 RPS
 cpu_mask_all() {
     local n=$1 i out="" bits w words
-    # words 必须单独一行赋值：同一条 local 语句里引用刚赋值的 n，展开时 n 还看不到值
+    # words 需单独一行赋值，同一条 local 语句内引用刚赋值的 n 会展开不到值
     words=$(((n + 31) / 32))
     for ((i = words - 1; i >= 0; i--)); do
         bits=$((n - i * 32))
@@ -2723,8 +3083,7 @@ cpu_mask_all() {
     echo "$out"
 }
 
-# 掩码是否表示「已启用」。内核会重排掩码格式（补零、改分组），字符串相等比较不可靠，
-# 判「去掉 0 和逗号后还有内容」才对
+# 掩码是否表示「已启用」：内核会重排格式，字符串比较不可靠，改判去掉 0 和逗号后是否还有内容
 mask_is_set() {
     case "$(echo "$1" | tr -d '0,[:space:]')" in
     '') return 1 ;;
@@ -2751,8 +3110,7 @@ nic_hw_queues() {
 tune_nic() {
     echo -e "\n${YELLOW}>>> 网卡队列与软中断分发${NC}"
     save_original_values || { pause_return; return 1; }
-    # ethtool 用来读硬件队列数和丢包计数。缺了不致命（会退回数 rx-* 目录），但装上判断更准。
-    # 旧版这里只写了 apt-get 和 yum，在 openSUSE/Arch/Alpine 上是静默失败的
+    # ethtool 读硬件队列数与丢包计数，缺了不致命（退回数 rx-* 目录），装上判断更准
     if ! ensure_tools ethtool >/dev/null; then
         echo -e "  ${YELLOW}ethtool 不可用，硬件队列数改用 rx-* 目录数估算，ring buffer 丢包检查跳过${NC}"
     fi
@@ -2760,7 +3118,7 @@ tune_nic() {
     local cpu_count mask flow_entries plan_tmp done_any=0
     cpu_count=$(nproc)
     mask=$(cpu_mask_all "$cpu_count")
-    # RFS 全局表大小，按核数给，钳到 [32768, 262144]
+    # RFS 全局表大小按核数给，钳到 [32768, 262144]
     flow_entries=$((cpu_count * 4096))
     [ "$flow_entries" -lt 32768 ] && flow_entries=32768
     [ "$flow_entries" -gt 262144 ] && flow_entries=262144
@@ -2768,14 +3126,10 @@ tune_nic() {
     mkdir -p "$STATE_DIR"
     plan_tmp=$(mktemp)
 
-    # RFS 全局表必须先分配，再配每队列的 rps_flow_cnt——顺序反了的话单队列表配了也没有全局表可用。
-    # 写进独立的 drop-in 文件而不是追加到 $SYSCTL_OPT：本菜单可以单独执行（用户没跑过菜单 3/4），
-    # 那时 $SYSCTL_OPT 不存在，追加式写法会静默丢掉持久化，重启后 /sys 下的 plan 被 unit 重放了、
-    # 但全局流表是 0，RFS 处于半失效状态
+    # RFS 全局表必须先分配再配每队列 rps_flow_cnt，顺序反了全局表就没法用
+    # 写独立 drop-in 而非追加 $SYSCTL_OPT：本菜单可单独执行，那时 $SYSCTL_OPT 可能不存在，追加会静默丢持久化
     [ "$DRYRUN" = "1" ] || sysctl -w net.core.rps_sock_flow_entries="$flow_entries" &>/dev/null
-    # 写失败必须中止：RFS 的全局流表是每队列 rps_flow_cnt 的前提，这份文件没落地
-    # 就等于重启后全局表是 0、而各队列的 rps_flow_cnt 被 $NIC_APPLY 重放了回来——
-    # RFS 处于半失效状态，而面板会照常报「已开启+持久化」。
+    # 写失败必须中止：全局流表没落地，重启后会出现「每队列有值、全局表是 0」的 RFS 半失效状态
     # [人工决策-2026-08-05 20:14:33] 原先写成 A && B && cat >... 的 && 链，cat 失败后
     # 函数照样往下走到 apply_sysctl 并返回 0（/dev/full 可复现）。这种 && 链形式还逃过了
     # 「无裸写 cat」的通用机检（它只匹配行首的 cat >），机检判据已一并修正
@@ -2803,12 +3157,11 @@ EOF
         nqueues=$(ls -d /sys/class/net/"$eth"/queues/rx-* 2>/dev/null | wc -l)
         [ "$nqueues" -eq 0 ] && continue
 
-        # 硬件队列已经够多时不开 RPS：RSS 已经把包分到各核，再叠一层软件分发只是多一次
-        # IPI 和跨核唤醒，延迟反而升高。内核 scaling.rst 也是这个说法
+        # 硬件队列已够多时不开 RPS：RSS 已分好核，再叠软件分发只会多一次 IPI 抬高延迟（内核 scaling.rst）
         if [ "$hwq" -ge "$cpu_count" ] && [ "$hwq" -gt 1 ]; then
-            echo -e "  ${CYAN}$eth${NC} 硬件队列 $hwq 个（>= $cpu_count 核），RSS 已足够，跳过 RPS"
+            echo -e "  ${CYAN}$eth${NC}: RSS 足够，跳过 RPS"
         else
-            [ "$hwq" -gt 1 ] && echo -e "  ${CYAN}$eth${NC} 硬件队列 $hwq 个 < $cpu_count 核，用 RPS 补足软中断分摊"
+            [ "$hwq" -gt 1 ] && echo -e "  ${CYAN}$eth${NC}: RPS 补足（$hwq 队列 < $cpu_count 核）"
             per_flow=$((flow_entries / nqueues))
             for f in /sys/class/net/"$eth"/queues/rx-*/rps_cpus; do
                 [ -f "$f" ] || continue
@@ -2821,7 +3174,7 @@ EOF
                     done_any=1
                 fi
             done
-            # rps_flow_cnt 应为 全局表/队列数，而非以前固定的 4096
+            # rps_flow_cnt = 全局表/队列数，非固定 4096
             for f in /sys/class/net/"$eth"/queues/rx-*/rps_flow_cnt; do
                 [ -f "$f" ] || continue
                 if [ "$DRYRUN" = "1" ]; then
@@ -2832,8 +3185,7 @@ EOF
             done
         fi
 
-        # XPS（发送侧）：把每个 tx 队列绑到一组 CPU，减少多核并发发送时的队列锁竞争。
-        # 之前完全没做。有多个 tx 队列时按队列轮转分配 CPU，单队列就全核
+        # XPS（发送侧）：把每个 tx 队列绑到一组 CPU，减少多核并发发送的队列锁竞争；多队列按轮转分配，单队列全核
         local txn i cpu xmask
         txn=$(ls -d /sys/class/net/"$eth"/queues/tx-* 2>/dev/null | wc -l)
         if [ "$txn" -gt 0 ]; then
@@ -2857,21 +3209,17 @@ EOF
             done
         fi
 
-        # ring buffer 改为按需：拉满能减少突发丢包，但抬高排队延迟、加剧网卡级 bufferbloat，
-        # 且已知会瞬断几百毫秒。先看驱动计数器有没有真的丢包再决定
+        # ring buffer 按需：拉满会抬高排队延迟、加剧 bufferbloat，先看驱动计数器有无真实丢包
         local drops
         drops=$(ethtool -S "$eth" 2>/dev/null | grep -iE 'drop|over|miss|fifo' |
             awk -F: '{gsub(/ /,"",$2); s+=$2} END{print s+0}')
         if [ "${drops:-0}" -gt 0 ]; then
-            echo -e "  ${YELLOW}$eth 驱动计数器有 ${drops} 次丢包/溢出，可考虑加大 ring buffer${NC}"
-            echo -e "  ${YELLOW}  命令: ethtool -G $eth rx <max> tx <max>（会瞬断几百毫秒，请在低峰执行）${NC}"
-            echo -e "  ${YELLOW}  上限查询: ethtool -g $eth${NC}"
+            echo -e "  ${YELLOW}$eth 有 ${drops} 次丢包，可 ethtool -G $eth rx <max> 加大 ring buffer${NC}"
         fi
     done
 
     if [ "$done_any" = "1" ]; then
-        # plan 是开机重放脚本唯一消费的状态文件——它没落地就装 unit，等于装一个开机
-        # 读不到数据、什么都不做的服务，而面板会报「已启用并校验通过」。
+        # plan 没落地就装 unit 等于装一个开机什么都不做的服务，还报成功
         # [人工决策-2026-08-05 22:14:38] 原先是裸 `sort -u > "$NICPLAN"` 不查返回值，
         # /dev/full 复现：sort 已报 No space left on device，后续仍装 unit 并报成功、rc=0。
         # 走 atomic_write 一并拿到链接防护与原子性（写一半断电不会留半截 plan）
@@ -2882,11 +3230,11 @@ EOF
             pause_return
             return 1
         fi
-        echo -e "${GREEN}完成：RPS/XPS 掩码 $mask（$cpu_count 核），RFS 全局表 $flow_entries${NC}"
+        echo -e "${GREEN}完成：RPS/XPS 已配置${NC}"
         if install_nic_unit; then
-            echo -e "  ${GREEN}开机单元 $(basename "$NIC_UNIT") 已启用并校验通过，重启后仍生效${NC}"
+            echo -e "  ${GREEN}开机单元已启用并校验通过${NC}"
         else
-            echo -e "  ${YELLOW}未能启用开机单元，/sys 下的设置重启后会失效（详见上面的原因）${NC}"
+            echo -e "  ${YELLOW}开机单元未能启用，重启后 /sys 设置会失效${NC}"
         fi
     else
         echo -e "${YELLOW}未改动：没找到可写的网卡队列（容器或只读 /sys 环境常见）${NC}"
@@ -2910,14 +3258,10 @@ cpu_mask_one() {
     echo "$out"
 }
 
-# /sys 下的设置重启即失效。用一个 oneshot unit 在开机时重放 plan。
-# unit 里不调用本脚本的函数——bash 不 hoist 函数定义，「参数分发在文件头、函数在后面」
-# 的写法会让 unit 报 command not found 却仍 exit 0，systemctl status 显示成功而实际什么都没做
-# （社区里有脚本正是这么翻车的）。所以生成一个独立的、只读 plan 的小脚本
-# has_systemd 定义在「环境探测」小节（菜单 2/3/4 判持久化也要用它，必须早于本处定义）
+# /sys 设置重启即失效，用 oneshot unit 在开机时重放 plan；unit 不调用本脚本函数（bash 不 hoist，
+# 会 command not found 却仍 exit 0），改为生成独立的只读 plan 小脚本
 
-# 返回 0 表示 unit 确实已 enable。状态判据用它，而不是「unit 文件存在」——
-# 文件是我们无条件写的，写成功不代表 systemd 接受了它
+# 返回 0 表示 unit 确实已 enable，而非仅「unit 文件存在」——文件是无条件写的，写成功不代表 systemd 接受了它
 nic_unit_enabled() {
     has_systemd || return 1
     [ -f "$NIC_UNIT" ] || return 1
@@ -2926,44 +3270,35 @@ nic_unit_enabled() {
 
 install_nic_unit() {
     if ! has_systemd; then
-        echo -e "  ${YELLOW}本机不由 systemd 管理（WSL / 容器 / sysvinit），无法安装开机单元${NC}"
-        # 应用脚本仍然写出来，方便用户自己挂。写不成要如实说——
-        # 后面那些「已生成开机重放脚本」的提示都以它落地为前提
+        echo -e "  ${YELLOW}无 systemd，无法安装开机单元${NC}"
+        # 应用脚本仍写出来方便用户自己挂，写不成要如实说
         if ! write_nic_apply; then
             echo -e "  ${RED}辅助脚本未能写出（原因见上），无法提供任何形式的开机重放${NC}"
             return 1
         fi
-        # 本菜单还往 $NIC_SYSCTL_OPT 写了 RFS 全局流表（rps_sock_flow_entries），
-        # 那是个 sysctl 参数、不在 nic.plan 里，$NIC_APPLY 不重放它。
-        # 只挂 nic-apply 的话重启后每队列 rps_flow_cnt 回来了、全局表却是 0，
-        # RFS 处于半失效状态。所以这里也要把 sysctl 重放脚本备好，并让用户一次挂对：
-        # sysctl-apply 内部已经会调 nic-apply，挂它一个就够
+        # $NIC_SYSCTL_OPT 里的 RFS 全局流表是 sysctl 参数，$NIC_APPLY 不重放它，
+        # 只挂 nic-apply 会导致全局表是 0、RFS 半失效，须同时备好 sysctl 重放脚本（它内部会调 nic-apply）
         if is_container; then
             echo -e "  ${YELLOW}当前设置本次有效，重启后失效。容器的持久化由宿主决定${NC}"
             return 1
         fi
         if write_sysctl_apply; then
-            echo -e "  ${YELLOW}当前设置本次有效，重启后失效${NC}"
-            echo -e "  ${GREEN}已生成开机重放脚本 $SYSCTL_APPLY${NC}（含 RFS 全局表与本菜单的队列设置）"
+            echo -e "  ${GREEN}已生成 $SYSCTL_APPLY${NC}"
             wsl_boot_hint
         else
-            echo -e "  ${YELLOW}当前设置本次有效，重启后失效。如需持久化请自行把 $NIC_APPLY 挂到你的 init 流程${NC}"
-            echo -e "  ${YELLOW}注意 $NIC_APPLY 不含 RFS 全局表，还需自行重放 $NIC_SYSCTL_OPT${NC}"
+            echo -e "  ${YELLOW}需手动挂 $NIC_APPLY 到 init 流程，并另行重放 $NIC_SYSCTL_OPT（RFS 全局表）${NC}"
         fi
         return 1
     fi
 
-    # helper 是 unit 的 ExecStart 目标。它没落地就装 unit，等于装一个开机必然
-    # 报 status=203/EXEC 的服务，而 systemctl enable 会成功——那就是假报持久化
+    # helper 没落地就装 unit，会成 status=203/EXEC 且 enable 仍报成功，等于假报持久化
     if ! write_nic_apply; then
-        echo -e "  ${RED}辅助脚本未能写出（原因见上），不安装开机单元${NC}"
-        echo -e "  ${YELLOW}  否则会装出一个开机必定失败的服务，且 systemctl enable 仍会成功${NC}"
+        echo -e "  ${RED}辅助脚本写出失败，不安装开机单元${NC}"
         return 1
     fi
 
     refuse_if_symlink "$NIC_UNIT" || return 1
-    # 写失败就别往下 enable 了：那会 enable 一个内容不完整的 unit，
-    # 而 systemctl enable 仍可能成功，于是面板报「已启用并校验通过」
+    # 写失败就不往下 enable：否则会 enable 一个内容不完整的 unit 却报成功
     if ! cat >"$NIC_UNIT" <<UNITEOF
 [Unit]
 Description=tcp-dashboard: apply RPS/RFS/XPS queue settings
@@ -3004,8 +3339,7 @@ UNITEOF
 }
 
 write_nic_apply() {
-    # 这个辅助脚本是 RPS/XPS/qdisc 持久化的唯一执行者：它没落地，unit 装得再好
-    # 开机也什么都不会做。所以写入失败必须让调用方知道。
+    # 本脚本是 RPS/XPS/qdisc 持久化的唯一执行者，没落地 unit 装再好也没用，写入失败必须让调用方知道
     # [人工决策-2026-08-05 15:48:02] 早前 cat 与 chmod 都不查返回值、函数恒返回 0，
     # 于是 install_nic_unit 照常建 unit 并报「开机重放已装好」。用 /dev/full 做
     # 目标可复现：shell 已报 No space left on device，函数仍返回 rc=0。
@@ -3014,9 +3348,7 @@ write_nic_apply() {
     if ! cat >"$NIC_APPLY" <<'APPLYEOF'
 #!/bin/bash
 # 由 tcp-dashboard 生成：开机重放 RPS/RFS/XPS 与 qdisc 设置。
-# 两份 plan 都是「不存在就跳过」——网卡改名或队列数变化时不报错退出。
-# 本脚本不调用主脚本的任何函数：bash 不 hoist 函数定义，那种写法会 command not found
-# 却仍 exit 0，systemctl status 显示成功而实际什么都没做（社区里有脚本正是这么翻车的）
+# 两份 plan 均「不存在就跳过」；本脚本不调用主脚本函数（bash 不 hoist，会假成功）
 
 # --- 1. /sys 队列设置（路径<TAB>值，直接写入）---
 PLAN="/var/lib/tcp-dashboard/nic.plan"
@@ -3027,8 +3359,7 @@ if [ -f "$PLAN" ]; then
 fi
 
 # --- 2. qdisc（网卡<TAB>目标qdisc，要跑 tc 且区分多队列）---
-# 多队列网卡的 root 恒为 mq/mqprio，真实 qdisc 在叶子上。必须逐叶子替换：
-# 顶掉 mq 会让所有硬件队列共用一把 qdisc 锁，等于主动放弃多队列
+# 多队列网卡 root 恒为 mq/mqprio，真实 qdisc 在叶子上，必须逐叶子替换，顶掉 mq 等于放弃多队列
 QPLAN="/var/lib/tcp-dashboard/qdisc.plan"
 if [ -f "$QPLAN" ] && command -v tc >/dev/null 2>&1; then
     while IFS=$'\t' read -r qdev qwant; do
@@ -3037,10 +3368,7 @@ if [ -f "$QPLAN" ] && command -v tc >/dev/null 2>&1; then
         qroot=$(tc qdisc show dev "$qdev" 2>/dev/null | awk 'NR==1{print $2}')
         case "$qroot" in
         mq | mqprio)
-            # 队列号必须自己拼，不能枚举现有的 parent 行：开机时叶子可能还没建出来
-            # （或被 del 过），那时 tc 输出只剩一行 mq、没有任何 parent 行可枚举——
-            # 实测 del 掉全部叶子后 tc qdisc show 只有 "qdisc mq 1: root"，重放静默失效。
-            # 取 root 的 handle（第 3 字段，形如 "1:"）+ 队列序号 1..N，N 从 sysfs 数
+            # 队列号自己拼，不枚举现有 parent 行：开机时叶子可能还没建出来，枚举会拿到空集
             qh=$(tc qdisc show dev "$qdev" 2>/dev/null | awk 'NR==1{print $3}')
             [ -n "$qh" ] || continue
             qn=0
@@ -3067,22 +3395,19 @@ APPLYEOF
         echo -e "  ${RED}  开机重放脚本没落地，队列设置重启后不会恢复${NC}"
         return 1
     fi
-    # 没有可执行位，unit 里的 ExecStart 会 Permission denied，等于持久化没做成
+    # 没有可执行位，ExecStart 会 Permission denied，等于持久化没做成
     if ! chmod 755 "$NIC_APPLY"; then
         echo -e "  ${RED}给 $NIC_APPLY 加可执行位失败，开机重放不会生效${NC}"
         return 1
     fi
-    # 兜底确认结果真的存在且可执行——前面每步都查了，这里再确认一次落地结果
+    # 兜底确认落地结果真的存在且可执行
     if [ ! -x "$NIC_APPLY" ]; then
         echo -e "  ${RED}$NIC_APPLY 写完后仍不可执行，开机重放不会生效${NC}"
         return 1
     fi
 
-    # 路由感知兜底：网卡每次变为 routable 时再跑一遍。
-    # oneshot unit 只在开机触发一次，而网卡热插拔、重连、或 systemd-networkd 重配
-    # 之后 /sys 下的队列设置会回到默认。这个目录只在装了 systemd-networkd 的机器上
-    # 存在（用 ifupdown / NetworkManager 的机器没有），所以是「有就加、没有不报错」。
-    # 关键是 exec 同一个 $NIC_APPLY——两处共用一份逻辑，不会漂移
+    # 路由感知兜底：网卡热插拔/重连后 oneshot unit 不会再跑，靠 networkd-dispatcher 补一次；
+    # 该目录只在装了 systemd-networkd 的机器上存在，有就加、没有不报错，exec 同一个 $NIC_APPLY
     if [ -d /etc/networkd-dispatcher/routable.d ] && refuse_if_symlink "$NIC_DISPATCH"; then
         if printf '#!/bin/sh\nexec %s\n' "$NIC_APPLY" >"$NIC_DISPATCH" 2>/dev/null &&
             chmod 755 "$NIC_DISPATCH" 2>/dev/null; then
@@ -3097,23 +3422,13 @@ APPLYEOF
 # ==================================================
 # --- c. 让 default_qdisc 立刻在已有网卡上生效 ---
 # ==================================================
-# 为什么单独一项、而不是塞进菜单 2 或一键流程：
-#   1) 这是运行时改动（tc），不是文件级改动。重启即失效，与本项目其他改动的性质不同；
-#   2) 队列切换瞬间会丢弃已排队的包，虽然量很小但非零，而本面板经 SSH 使用；
-#   3) 大多数人不需要它——重启一次 default_qdisc 就自动接管了。
-# 所以做成用户主动选择、进去前明确告知风险的独立项。
-#
-# 多队列网卡的正确改法是逐个叶子替换，绝不能动 root。实测对照（4 队列 veth）：
-#   错误做法 tc qdisc replace dev X root fq  =>  mq 与 4 个子 qdisc 被压成 1 个
-#                                               共享 fq（refcnt 5），多核高 PPS 下
-#                                               所有队列争同一把锁
-#   正确做法 tc qdisc replace dev X parent 1:N fq  =>  root 仍是 mq，每队列独立 fq
+# 运行时改动（tc）重启即失效，切换瞬间会丢包，多数人重启一次即可
+# 多队列网卡必须逐叶子替换，不能动 root（实测 replace root 会压成单队列争锁）
 # [人工决策-2026-08-05 11:02:33] 社区脚本（Bud668/vps-mgr、LightKnightBBR 等）普遍
 # 无条件 replace root，等于在多队列机器上主动放弃多队列。本项目按 root 类型分流
 apply_live_qdisc() {
     echo -e "\n${YELLOW}>>> 让 default_qdisc 在已有网卡上立刻生效${NC}"
-    # 这是写入类操作（不是只读菜单），按本项目约定缺工具就装。
-    # RHEL 系把 tc 拆到独立包 iproute-tc，pkg_for 已处理这个映射
+    # 写入类操作缺工具就装；RHEL 系把 tc 拆到独立包 iproute-tc，pkg_for 已处理映射
     if ! command -v tc >/dev/null 2>&1; then
         ensure_tools tc >/dev/null
         if ! command -v tc >/dev/null 2>&1; then
@@ -3148,9 +3463,7 @@ apply_live_qdisc() {
         ;;
     esac
 
-    # noqueue 不是「没配好」而是设备类型决定的：内核文档明写 lo 与 veth 忽略
-    # default_qdisc 并固定用 noqueue（"lo/veth ignore this setting and instead
-    # default to noqueue"）。容器里出口网卡就是 veth，此时改它既无意义也不该改
+    # noqueue 是设备类型决定的：内核文档明写 lo/veth 忽略 default_qdisc 固定用 noqueue，改它无意义
     if [ "$root" = "noqueue" ]; then
         echo -e "  ${YELLOW}本设备是 noqueue：lo / veth 这类虚拟设备按内核设计忽略 default_qdisc${NC}"
         echo -e "  ${YELLOW}容器内的出口网卡通常就是 veth。宿主机上的物理网卡才需要本项${NC}"
@@ -3158,7 +3471,7 @@ apply_live_qdisc() {
         return 0
     fi
 
-    # 已经是目标值就不动——幂等，且避免无谓的队列切换
+    # 已是目标值就不动，幂等
     local effective=$root
     case "$root" in mq | mqprio) effective=$leaf ;; esac
     if [ "$effective" = "$want" ]; then
@@ -3200,8 +3513,7 @@ apply_live_qdisc() {
     fi
     case "$root" in
     mq | mqprio)
-        # parent handle 直接取 tc 输出里 parent 后一个字段。不能硬编码 8001:N ——
-        # 主号由内核分配，带 dev 查询时还会省略成 :N，两种形式都能原样回传给 tc
+        # parent handle 取 tc 输出里 parent 后一个字段，不硬编码（主号由内核分配）
         for p in $(tc qdisc show dev "$dev" 2>/dev/null |
             awk '/parent/{for(i=1;i<=NF;i++) if($i=="parent") print $(i+1)}'); do
             if tc qdisc replace dev "$dev" parent "$p" "$want" 2>/dev/null; then
@@ -3227,7 +3539,7 @@ apply_live_qdisc() {
         return 1
     fi
 
-    # 回读校验：tc 返回 0 不等于真的换了（曾有 mq 场景 replace 成功但叶子没变）
+    # 回读校验：tc 返回 0 不等于真的换了
     IFS=$'\t' read -r root leaf <<<"$(qdisc_kinds "$dev")"
     local now=$root
     case "$root" in mq | mqprio) now=$leaf ;; esac
@@ -3239,10 +3551,7 @@ apply_live_qdisc() {
         echo -e "  ${YELLOW}请手动检查: tc qdisc show dev $dev${NC}"
     fi
 
-    # 持久化：写进独立的 qdisc plan，由同一个 $NIC_APPLY 在开机时重放。
-    # 不复用 $NICPLAN——那份是「路径<TAB>值」的 /sys 写入，格式和执行方式都不同
-    # 走 atomic_write：它自带链接防护，且 plan 是回退时要读的状态文件，
-    # 写一半就断电会让开机重放拿到半截内容
+    # 持久化写进独立的 qdisc plan（格式与 $NICPLAN 不同，不复用），走 atomic_write 防半截写入
     if ! printf '%s\t%s\n' "$dev" "$want" | atomic_write "$QDISCPLAN"; then
         echo -e "  ${YELLOW}qdisc plan 写入失败，本次改动重启后不会重放${NC}"
     fi
@@ -3257,16 +3566,11 @@ apply_live_qdisc() {
 # ==================================================
 # --- 8. 诊断：调 sysctl 到底有没有用 ---
 # ==================================================
-# 这一项只读，不改任何东西。
-# 思路：光看「参数写进去了」证明不了有效果。内核在每条连接上记了瓶颈到底在哪，
-# ss -ti 会把它暴露出来——sndbuf_limited / rwnd_limited / app_limited 三个计时器
-# 分别对应「本机发送缓冲不够」「对端接收窗口小」「应用自己喂不满」。
-# 只有第一种调本机 sysctl 才有救，后两种调了也白调。
+# 只读，不改任何东西。ss -ti 暴露内核记的连接级瓶颈：sndbuf_limited/rwnd_limited/app_limited
+# 分别对应本机缓冲不够、对端窗口小、应用喂不满，只有第一种调本机 sysctl 才有救
 diagnose() {
     echo -e "\n${YELLOW}>>> 网络瓶颈诊断（只读，不修改任何设置）${NC}"
-    # 只读功能不装包：文案对外承诺「零副作用、生产机可直接跑」，而装包会动
-    # apt/dpkg 数据库、刷新索引、往系统里装新二进制——那不是零副作用。
-    # 缺工具就降级并给出手动补装命令，由用户自己决定要不要在这台机器上装
+    # 只读功能不装包：装包会动 apt/dpkg 数据库，不是零副作用；缺工具就降级给手动补装命令
     require_tools_readonly ss nstat tc
     local dev cc qdisc live_qdisc bbr_ver
     dev=$(egress_dev)
@@ -3276,9 +3580,7 @@ diagnose() {
     draw_line
     echo -e "  出口网卡     : ${CYAN}${dev:-未识别}${NC}"
     echo -e "  拥塞算法     : ${CYAN}${cc}${NC}$(bbr_version_label)"
-    # 可用算法列表比「设完再回显」可靠：回显只说明当前值，说明不了 bbr 到底能不能选。
-    # 内核没编 tcp_bbr、或模块没加载时，写 bbr 会被 sysctl 拒绝而当前值原样不动——
-    # 那种情况下只看当前值会以为「本来就不是 bbr」，而不知道是「根本用不了」
+    # 可用算法列表比只看当前值可靠：bbr 写入被拒时当前值不变，容易误判为「本来就不是 bbr」
     local avail_cc
     avail_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
     if [ -n "$avail_cc" ]; then
@@ -3289,12 +3591,8 @@ diagnose() {
         esac
     fi
     echo -e "  default_qdisc: ${CYAN}${qdisc}${NC}"
-    # default_qdisc 只对「之后新建」的网卡队列生效，已存在的网卡不受影响。
-    # 所以必须查这块网卡实际挂的 qdisc，否则会误以为 fq 已经在跑。
-    #
-    # 但「实际挂的」在多队列网卡上不是 root：root 恒为 mq/mqprio，真正的 qdisc 在每个
-    # 硬件队列的叶子上。内核文档原话是多队列网卡 root 保持 mq、default_qdisc 作用于叶子
-    # （"multiqueue NICs keep mq as root and use this for leaves"）。
+    # default_qdisc 只对之后新建的队列生效，须查网卡实际挂的 qdisc；多队列网卡 root 恒为
+    # mq/mqprio，真实 qdisc 在叶子上（内核文档：multiqueue NICs keep mq as root）
     # [人工决策-2026-08-05 10:32:41] 早期版本只取 tc 输出第一行的 root 去比 default_qdisc，
     # 在任何多队列网卡上都必然报「不一致」——实测 root=mq / default_qdisc=fq_codel 即触发。
     # 改为 root 是 mq/mqprio 时以叶子类型为判据，且不自动执行 tc qdisc replace：
@@ -3304,7 +3602,7 @@ diagnose() {
         IFS=$'\t' read -r live_root live_leaf <<<"$(qdisc_kinds "$dev")"
         case "$live_root" in
         mq | mqprio)
-            # 叶子可能不止一种（有人手工只改了部分队列），全列出来
+            # 叶子可能不止一种（部分队列被手工改过），全列出来
             echo -e "  实际 root qdisc: ${CYAN}${live_root}${NC}（多队列容器，本身不是排队算法）"
             echo -e "    叶子 qdisc   : ${CYAN}${live_leaf:-未知}${NC}"
             effective=$live_leaf
@@ -3318,14 +3616,13 @@ diagnose() {
             effective=$live_root
             ;;
         esac
-        # noqueue 是设备类型决定的，不是配置问题：内核文档明写 lo 与 veth 忽略
-        # default_qdisc。容器内出口网卡就是 veth，报「不一致」会误导
+        # noqueue 是设备类型决定的，不是配置问题，报「不一致」会误导
         if [ "$effective" = "noqueue" ]; then
             echo -e "    ${YELLOW}=> noqueue 是 lo / veth 这类虚拟设备的固定行为，按内核设计忽略 default_qdisc${NC}"
             echo -e "    ${YELLOW}   容器内出口就是 veth，这里无需也无法改动${NC}"
             effective=""
         fi
-        # 叶子有多种时 effective 含空格，不等于单个 qdisc 名，同样算不一致
+        # 叶子有多种时 effective 含空格，同样算不一致
         if [ -n "$effective" ] && [ -n "$qdisc" ] && [ "$effective" != "$qdisc" ]; then
             echo -e "    ${YELLOW}=> 与 default_qdisc（$qdisc）不一致${NC}"
             echo -e "    ${YELLOW}   default_qdisc 只影响之后新建的队列。重启即生效；${NC}"
@@ -3341,11 +3638,8 @@ diagnose() {
         echo -e "  ${YELLOW}缺少 ss 命令（iproute2），跳过连接级归因${NC}"
     else
         local stats
-        # 汇总所有已建立连接的受限计时器与重传。计时器单位是微秒，取相对占比而非绝对值。
-        #
-        # app_limited 与另外两个不同：它是「裸标记」，没有跟数值（实测 ss 输出里就是
-        # 独立的单词 app_limited），表示这条连接当前受限于应用喂数据的速度而非网络。
-        # 所以它只能数「有多少条连接带这个标记」，不能像 sndbuf_limited 那样算时间占比。
+        # 汇总所有已建立连接的受限计时器与重传，单位微秒，取相对占比。
+        # app_limited 是裸标记（无跟随数值），只能数命中的连接数，不能像其他两项算时间占比
         # [人工决策-2026-08-05 10:41:07] 实测一台真实机器：app_limited 出现 11 次、
         # rwnd_limited 11 次、sndbuf_limited 0 次。app_limited 才是现实中最常见的
         # 「其实调参没用」信号，而早期版本只在注释里提过它、代码没解析，落到 else 分支
@@ -3354,10 +3648,8 @@ diagnose() {
             /sndbuf_limited:/ { match($0, /sndbuf_limited:[0-9]+/); s += substr($0, RSTART+15, RLENGTH-15) }
             /rwnd_limited:/   { match($0, /rwnd_limited:[0-9]+/);   r += substr($0, RSTART+13, RLENGTH-13) }
             /busy:/           { match($0, /busy:[0-9]+/);           b += substr($0, RSTART+5,  RLENGTH-5) }
-            # 词边界要自己保证：app_limited 是裸标记，直接 /app_limited/ 会被将来
-            # 可能出现的同前缀字段误伤，锚定前后为空白或行首行尾
+            # 锚定前后空白/行首尾，避免误伤未来可能出现的同前缀字段
             /(^|[ \t])app_limited([ \t]|$)/ { a++ }
-            # 连接数要数「每条连接的指标行」而不是含 retrans: 的行。
             # [人工决策-2026-08-05 10:48:15] 早期版本用 /retrans:/ 计数，但那个字段只在
             # 连接发生过重传时才出现——实测 28 条连接里只有 7 条有 retrans:，于是
             # 「活跃连接 N 条」长期少报，且拿它当分母会让 app_limited 占比算出 116%。
@@ -3379,9 +3671,7 @@ diagnose() {
             printf "    对端窗口受限 (rwnd_limited)   : %s%%\n" "$rwnd_pct"
             printf "    应用喂不满 (app_limited)     : %s/%s 条连接 (%s%%)\n" \
                 "${applim:-0}" "${nconn:-0}" "$app_pct"
-            # 判定顺序：缓冲区受限优先（那是本机能调的），再看对端，最后才是应用。
-            # app_limited 放在缓冲区之后——一条连接可能既 app_limited 又短暂 sndbuf_limited，
-            # 而后者才是可行动项
+            # 判定顺序：缓冲区受限（本机能调）优先，再对端，最后应用层
             if [ "$snd_pct" -ge 10 ]; then
                 echo -e "    ${GREEN}=> 发送缓冲是瓶颈：加大 wmem 有效，本脚本菜单 3 正对这个问题${NC}"
             elif [ "$rwnd_pct" -ge 10 ]; then
@@ -3399,8 +3689,7 @@ diagnose() {
     draw_line
 
     # --- 重传率（区分「窗口受限」和「丢包受限」的关键）---
-    # 计数器统一走 read_counters：有 nstat 用 nstat，没有则直读 /proc/net/{snmp,netstat}。
-    # 以前这里直接调 nstat 且同一份数据调了四遍，缺 nstat 时整段跳过
+    # 计数器统一走 read_counters：有 nstat 用 nstat，没有则直读 /proc/net/{snmp,netstat}
     local snap_a snap_b seg_out retrans rate
     snap_a=$(read_counters)
     seg_out=$(counter_get TcpOutSegs "$snap_a")
@@ -3409,9 +3698,7 @@ diagnose() {
         rate=$((retrans * 10000 / seg_out))
         echo -e "  ${CYAN}累计重传率${NC}: $((rate / 100)).$((rate % 100))%  (${retrans} / ${seg_out} 段，开机以来)"
 
-        # 累计值会被历史流量稀释：跑了几个月的机器上，即使现在丢包 5%，
-        # 累计值也可能只有 0.5%——分母里全是历史上正常的段。
-        # 判例：容器里注入 5% 丢包，累计重传率只显示 0.47%，结论行报「线路干净」。
+        # 累计值会被历史流量稀释（判例：容器注入 5% 丢包，累计重传率仍只显示 0.47%），
         # 所以再取一个 5 秒窗口的增量，结论以窗口值为准
         local o2 r2 d_out d_ret wrate=""
         echo -ne "  ${CYAN}近期重传率${NC}: 采样 5 秒 ..."
@@ -3442,17 +3729,9 @@ diagnose() {
         fi
 
         # --- 重传成因分解 ---
-        # 一个「重传率 2%」说明不了该做什么。拆成四类之后结论完全不同：
-        #   SynRetrans      建连阶段就在丢。跟传输中丢包是两回事——跨境线路握手丢包常见，
-        #                   表现是「连上很慢但连上后还行」，调缓冲区完全无关
-        #   Timeouts        RTO 硬等超时。这比重传率本身严重得多：快速重传（SACK 驱动）
-        #                   只损失一点吞吐，而 RTO 意味着连接停了至少一个 RTO 周期
-        #   SackRecovery    SACK 触发的快速恢复次数。它高是**健康**的——说明丢包被快速
-        #                   修好了。所以它单独看会误导，必须和 Timeouts 比：
-        #                   SackRecovery 占多数 = 恢复机制正常；Timeouts 占多数 = 恢复失败
-        #   LostRetransmit  重传包本身又丢了。持续性劣化的硬证据，重传率会被大流量稀释
-        #                   而这个计数器只要涨就是坏消息
-        # 四项的处置都是「sysctl 无解」，但归因准确能让用户不在缓冲区上白花时间
+        # 四类拆解，处置都是「sysctl 无解」但归因不同：SynRetrans 建连阶段丢包，与缓冲区无关；
+        # Timeouts 硬等超时，比重传率本身严重（每次至少停一个 RTO）；SackRecovery 高是健康信号，
+        # 须与 Timeouts 比占比；LostRetransmit 重传又丢，是持续劣化的硬证据
         local lostret synret timeouts sackrec
         lostret=$(counter_get TcpExtTCPLostRetransmit "$snap_b")
         [ -z "$lostret" ] && lostret=$(counter_get TcpExtTCPLostRetransmit "$snap_a")
@@ -3470,7 +3749,7 @@ diagnose() {
             printf "    重传又丢 (LostRetransmit)  : %s\n" "${lostret:--}"
             printf "    SACK 快速恢复 (SackRecovery): %s\n" "${sackrec:--}"
 
-            # 建连丢包单独判：它与传输质量无关，用户容易把两者混为一谈
+            # 建连丢包单独判：与传输质量无关，容易被混为一谈
             if [ "${synret:-0}" -gt 0 ] 2>/dev/null && [ "${retrans:-0}" -gt 0 ] 2>/dev/null; then
                 local sr_pct=$((synret * 100 / retrans))
                 [ "$sr_pct" -ge 20 ] &&
@@ -3498,11 +3777,8 @@ diagnose() {
         fi
 
         # --- tcp_mtu_probing 到底有没有真的触发过 ---
-        # 本脚本菜单 3 设了 tcp_mtu_probing=1、菜单 b 还专门做 PMTU 阶梯探测，
-        # 但那些都是「我们主动去探」。这两个计数器反映的是**真实业务连接**遇到的情况：
-        # 非零就说明内核确实在某条连接上启动过 MTU 探测，也就是说路径上真有黑洞、
-        # 而且这个参数正在起作用。这是全部受管参数里唯一能这样自证的一项，
-        # 比 ICMP 阶梯更可信（ICMP 可能被单独屏蔽，而这是 TCP 自己的数据）
+        # 菜单 3/b 都是主动探测，这两个计数器反映真实业务连接的情况：非零说明路径确有黑洞且参数在起作用，
+        # 比 ICMP 阶梯更可信（ICMP 可能被单独屏蔽，这是 TCP 自己的数据）
         local mtup_ok mtup_fail
         mtup_ok=$(counter_get TcpExtTCPMTUPSuccess "$snap_a")
         mtup_fail=$(counter_get TcpExtTCPMTUPFail "$snap_a")
@@ -3524,10 +3800,7 @@ diagnose() {
     draw_line
 
     # --- 队列容量证据：判断 somaxconn / netdev_max_backlog 到底有没有意义 ---
-    # 这两个参数社区脚本一律拉满，但拉满有没有用取决于是否真的溢出过。
-    # ListenOverflows = accept 队列满导致的丢弃（应用 accept 太慢或 backlog 太小）
-    # TCPBacklogDrop  = socket backlog 满导致的丢弃（接收侧处理不及）
-    # 两个都为 0 就说明本机根本没到容量瓶颈，加大它们纯属安慰剂
+    # ListenOverflows = accept 队列满丢弃，TCPBacklogDrop = socket backlog 满丢弃；两者都为 0 说明加大属安慰剂
     if [ -n "$snap_a" ]; then
         local lisov lisdrop bkdrop ofo
         lisov=$(counter_get TcpExtListenOverflows "$snap_a")
@@ -3547,7 +3820,7 @@ diagnose() {
                 echo -e "    ${GREEN}=> 均为 0：本机没到队列容量瓶颈，这两项属安慰剂（本脚本用 max 语义写入，不会反向调低）${NC}"
             fi
         fi
-        # 乱序入队：路径多径或重排。高值会拖累 SACK 恢复效率，但不是本机能调的
+        # 乱序入队：路径多径或重排，高值拖累 SACK 恢复效率，但不是本机能调的
         if [ -n "$ofo" ] && [ "${ofo:-0}" -gt 0 ] 2>/dev/null && [ "${seg_out:-0}" -gt 0 ] 2>/dev/null; then
             echo -e "  ${CYAN}乱序入队${NC} (TCPOFOQueue): ${ofo}"
             echo -e "    ${YELLOW}=> 路径存在重排/多径。SACK 已默认开启（本脚本不关它），本机无其他可调项${NC}"
@@ -3555,22 +3828,14 @@ diagnose() {
     fi
 
     # --- 各服务实际的 accept 队列容量：somaxconn 管得到谁 ---
-    # 上面的 ListenOverflows 是累计值，回答「曾经满过吗」；这里回答「现在离满多远」，
-    # 以及更要紧的一点：somaxconn 到底管不管得到这个服务。
-    #
-    # ss -Hltn 的 Send-Q 列对 LISTEN socket 来说是**该 socket 实际生效的 backlog**
-    # （即 sk_max_ack_backlog），Recv-Q 是当前已完成握手、等应用 accept 的连接数。
-    # 内核取 min(应用 listen() 传的 backlog, somaxconn)——所以 Send-Q 明显小于
-    # somaxconn 时，瓶颈在**应用自己传的值**，改 sysctl 一点用都没有。
-    # 这正是本脚本配置文件里那段 tcp_max_syn_backlog 注释讲的原理，但在此之前
-    # 用户没有任何手段看到自己的服务属于哪种情况（nginx 要写 listen ... backlog=，
-    # Go 程序看 net.ListenConfig，Java 看 ServerSocket 的 backlog 参数）
+    # ss -Hltn 的 Send-Q 是 LISTEN socket 实际生效的 backlog（sk_max_ack_backlog），
+    # Recv-Q 是等 accept 的连接数。内核取 min(listen() 传的值, somaxconn)，Send-Q 明显小于
+    # somaxconn 时瓶颈在应用自己传的值，改 sysctl 无效（nginx 要写 listen ... backlog=）
     if command -v ss >/dev/null 2>&1; then
         local somax listen_stat
         somax=$(sysctl -n net.core.somaxconn 2>/dev/null)
         if [ -n "$somax" ] && [ "${somax:-0}" -gt 0 ] 2>/dev/null; then
-            # 一次 awk 出全部结论：监听总数、backlog 低于 somaxconn 的个数、
-            # 当前有排队的个数、以及最小的那个 backlog 值与它的地址
+            # 一次 awk 出全部结论：监听总数、backlog 低于 somaxconn 的个数、排队个数、最小 backlog 值与地址
             listen_stat=$(ss -Hltn 2>/dev/null | awk -v sm="$somax" '
                 {
                     n++
@@ -3599,10 +3864,8 @@ diagnose() {
     fi
 
     # --- 内存压力：缓冲区「开太大」的反向信号 ---
-    # 这一段的方向和其他判据相反。PruneCalled/RcvPruned 是内核为了腾接收缓冲而裁剪
-    # 乱序队列，TCPMemoryPressures 是进入内存压力模式（会强制收缩所有连接的缓冲）。
-    # 它们非零说明缓冲区总量已经超出机器承受能力——此时该往下调而不是继续加大，
-    # 这正是本脚本用「内存 5%」钳住 BDP 推导结果的原因
+    # 方向与其他判据相反：PruneCalled/RcvPruned 是内核裁剪乱序队列腾缓冲，TCPMemoryPressures
+    # 是强制收缩所有连接缓冲，非零说明总量已超机器承受能力，此时该调小而非继续加大
     if [ -n "$snap_a" ]; then
         local prune rcvpr mempr
         prune=$(counter_get TcpExtPruneCalled "$snap_a")
@@ -3618,11 +3881,8 @@ diagnose() {
     fi
 
     # --- UDP 侧：QUIC / Hysteria2 的关键判据 ---
-    # UdpRcvbufErrors 直接对应 udp_rmem_min 与 rmem_max 该不该调。
-    # UdpInErrors 占 UdpInDatagrams 的比例是另一件事：Golden-GRE 记录过一个案例，
-    # GRO 在 GRE-in-UDP 隧道的 underlay 上错误合并包，导致 UdpInErrors 占到约 25%、
-    # TCP 吞吐从 1Mbit 恢复到 350Mbit/s（关掉该网卡 GRO 后 UdpInErrors 归零）。
-    # 所以高比例不是「UDP 缓冲小」，而是要怀疑 offload 与隧道封装冲突
+    # UdpRcvbufErrors 对应 udp_rmem_min/rmem_max 该不该调；UdpInErrors 占比高不是缓冲区问题，
+    # 而要怀疑 GRO 与隧道封装冲突（判例：GRE-in-UDP 上 GRO 错误合并包，关闭后 TCP 从 1Mbit 恢复到 350Mbit）
     if [ -n "$snap_a" ]; then
         local udperr udpin udprcv udpsnd
         udperr=$(counter_get UdpInErrors "$snap_a")
@@ -3666,10 +3926,8 @@ diagnose() {
     fi
 
     # --- NET_RX 软中断分布：RPS 该不该开的直接证据 ---
-    # 菜单 5 现在只按「硬件队列数 < 核数」决定开不开 RPS，那是能力判断而非需求判断：
-    # 单队列网卡不代表软中断真的成了瓶颈。RPS 的作用是把收包软中断从一个核摊到多核，
-    # 所以真正的证据是 NET_RX 是否集中在少数核上。全部核均摊时开 RPS 只是多一次
-    # IPI 与跨核唤醒，反而抬高延迟（内核 scaling.rst 也是这个说法）
+    # 菜单 5 只按硬件队列数<核数判断能力，不代表软中断真成了瓶颈；真正证据是 NET_RX
+    # 是否集中在少数核上，全核均摊时开 RPS 只会多一次 IPI 反而抬高延迟（内核 scaling.rst）
     if [ -r /proc/softirqs ]; then
         local rx_stat
         # 纯 POSIX awk：算最大核占比与核数。数值可能很大，用 awk 自己的浮点避免溢出
@@ -3686,8 +3944,7 @@ diagnose() {
             local rx_n rx_top rx_pct
             read -r rx_n rx_top rx_pct <<<"$rx_stat"
             echo -e "  ${CYAN}NET_RX 软中断分布${NC}: ${rx_n} 核，最忙的是 CPU${rx_top}（占 ${rx_pct}%）"
-            # 阈值取「均摊值的 3 倍」：n 核均摊每核 100/n%，集中到 3 倍以上才算倾斜。
-            # 单核机器恒为 100%，此时 RPS 无意义，单独排除
+            # 阈值取均摊值的 3 倍才算倾斜；单核机器恒为 100%，单独排除
             if [ "${rx_n:-1}" -le 1 ]; then
                 echo -e "    ${YELLOW}=> 单核机器，RPS 无意义（没有其他核可以分摊）${NC}"
             elif [ "$rx_pct" -ge $((300 / rx_n)) ] && [ "$rx_pct" -ge 40 ]; then
@@ -3699,8 +3956,7 @@ diagnose() {
     fi
 
     # --- qdisc 丢包：区分「本地出向队列」和「路径」---
-    # 必须累加所有 qdisc 行而不是只取第一个：多队列网卡第一行是 mq 的汇总，
-    # 而实际丢包发生在各叶子队列上。只取首行会在 mq 汇总不反映叶子时漏报
+    # 必须累加所有 qdisc 行：多队列网卡第一行是 mq 汇总，实际丢包发生在叶子队列
     if [ -n "$dev" ] && command -v tc &>/dev/null; then
         local qdrop
         qdrop=$(qdisc_drops "$dev")
@@ -3723,12 +3979,8 @@ diagnose() {
     fi
 
     # --- 转发与 MSS clamp 状态（中转档的两项改动是否还在）---
-    # iptables 规则重启即失效，用户可能跑过菜单 4 但重启后规则没了而 ip_forward 还在
-    # （后者写进了 drop-in），那种半生效状态从菜单状态栏看不出来。
-    #
-    # 查规则必须用 iptables-save 而不是 iptables -t mangle -S：后者会在 mangle 表
-    # 尚未使用时把 xt_TCPMSS/iptable_mangle 模块加载进内核，那就不是零副作用了。
-    # iptables-save 只遍历已经加载的表，读不到就说明本来没有
+    # iptables 规则重启即失效，可能出现 ip_forward 还在但规则已没了的半生效状态。
+    # 查规则用 iptables-save 而非 iptables -t mangle -S：后者会加载 mangle 表模块，不是零副作用
     local fwd
     fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
     if [ -n "$fwd" ]; then
@@ -3750,18 +4002,10 @@ diagnose() {
     pause_return
 }
 
-# BBR 版本标签。sysctl 回显 bbr 和 uname 里有 xanmod 都证明不了版本，
-# 唯一可靠判据是模块自报的 version（Google 的 v3 patch 里有 MODULE_VERSION("3")）。
-# XanMod 把 BBR 编进内核而非模块，modinfo 读的是 modules.builtin.modinfo，
-# 很老的 kmod 读不到——这时报「未知」而不是判失败
-#
-# 主线 tcp_bbr.c 从来没写过 MODULE_VERSION，所以「读不到 version」有两种成因：
-# 模块确实没报版本，或者 modinfo 通路本身不可用。用 tcp_cubic 当探针区分——主线
-# 一直给它写着 MODULE_VERSION("2.3")，探针读得到就说明通路正常。
-#
-# 但探针只能证明通路可用，证明不了「这就是主线 BBR」：任何不写 MODULE_VERSION
-# 的下游/自研 BBR 补丁在这里长得和主线一模一样。所以标签只陈述观察到的事实
-# 「模块未报版本」，不写成「主线 BBR」——缺少证据不是证据
+# BBR 版本标签。唯一可靠判据是模块自报的 version（v3 patch 有 MODULE_VERSION("3")）；
+# XanMod 内置编译，很老的 kmod 读不到时报「未知」而非判失败。主线 tcp_bbr.c 从不写
+# MODULE_VERSION，用 tcp_cubic 当探针区分「没报版本」与「通路不可用」，但探针证明不了
+# 是主线实现，标签只陈述观察事实
 # [人工决策-2026-08-04 23:07:09] 探针的结论边界：区分「模块没报版本」与「读不到」
 # 成立，据此推断「是主线实现」不成立。审查指出把缺少 version 当正向证据是结论强于
 # 证据，故标签退回事实陈述。未来要真正判定实现来源须另找判据（如比对模块签名/符号）
@@ -3786,8 +4030,7 @@ bbr_version_label() {
 # ==================================================
 # --- A. 调优前后效果测量 ---
 # ==================================================
-# 计数器一律取「时间窗内的增量」而不是绝对值——绝对值是开机以来的累计，看不出这次调优的效果。
-# 有 iperf3 就跑主动压测（-O 2 丢掉前 2 秒的慢启动），没有就只做被动观测
+# 计数器取时间窗内的增量而非绝对值（绝对值是开机以来累计）；有 iperf3 就压测（-O 2 丢慢启动），没有就被动观测
 measure() {
     echo -e "\n${YELLOW}>>> 调优效果测量${NC}"
     # 只读功能不自动装包，见 require_tools_readonly 的说明
@@ -3805,14 +4048,12 @@ measure() {
     snap1=$(counter_snapshot "$dev")
 
     # --- bufferbloat 的空载基线 ---
-    # 判据是「负载中的 RTT 相比空载涨了多少」。空载基线必须在打流量**之前**取，
-    # 而且要用同一个目标——用不同目标测出来的差值毫无意义。
-    # 只在有压测对端且 ping 可用时做：被动观测模式下「空载」和「负载」的边界不存在
+    # 判据是负载 RTT 相比空载涨多少，基线须在打流量前对同一目标取；被动观测模式无空载/负载边界，不做
     local bb_base="" bb_target=""
     if [ -n "$peer" ] && command -v ping >/dev/null 2>&1; then
         bb_target=$peer
         echo -e "  取空载 RTT 基线（对 $bb_target）..."
-        # 5 个包够看基线，别拖太久。取 avg 与 mdev
+        # 5 个包够看基线，取 avg 与 mdev
         bb_base=$(ping -c 5 -W 2 -q "$bb_target" 2>/dev/null | awk -F'/' '
             /rtt|round-trip/ { n = split($NF, a, " "); print $(NF-2) " " a[1]; exit }')
         if [ -n "$bb_base" ]; then
@@ -4062,13 +4303,12 @@ probe_mtu() {
 # --- 9. 一键全部（1+2+3+4）---
 # ==================================================
 run_all() {
-    echo -e "\n${YELLOW}>>> 一键全部优化：IPv4 优先 + BBR/FQ + 内核参数 + 网卡队列${NC}"
-    echo -e "  ${YELLOW}不会改 ring buffer（有丢包时只提示，避免瞬断）；不会改内核。${NC}"
+    echo -e "\n${YELLOW}>>> 一键全部优化${NC}"
 
     # 档位要用户明确选，不能默认给中转档——开 IP 转发对普通业务机是意外的语义变更
     echo -e "\n  这台机器的角色："
-    echo -e "    ${CYAN}1${NC}) 普通业务机（Web / 面板 / 数据库 / 一般应用）—— 保守档，不开转发"
-    echo -e "    ${CYAN}2${NC}) 中转 / 代理 / 隧道节点 —— 保守档 + IP 转发 + MSS Clamp"
+    echo -e "    ${CYAN}1${NC}) 普通业务机 —— 保守档"
+    echo -e "    ${CYAN}2${NC}) 中转/代理/隧道 —— 中转档（+IP 转发 + MSS Clamp）"
     read -p "  选择 [1/2，回车默认 1]: " role
     case "$role" in
     2) PROFILE=transit ;;
@@ -4113,8 +4353,12 @@ rollback_tune() {
     echo -e "\n${YELLOW}>>> 回退全部优化${NC}"
     local had_systemd_limits=0
     [ -f "$SYSTEMD_LIMITS_OPT" ] && had_systemd_limits=1
+    # $IPV6_OPT 在这份清单里：菜单 i 关掉的 IPv6 属「本脚本改的状态」，
+    # 菜单 6 承诺「还原成第一次运行前的样子」就必须连它一起还原。
+    # 三个 disable_ipv6 key 已在 MANAGED_KEYS 里，运行时值由下面的 restore_managed_keys 写回
     rm -f "$SYSCTL_OPT" "$LEGACY_SYSCTL_OPT" "$NIC_SYSCTL_OPT" "$LIMITS_OPT" "$BBR_OPT" \
         "$SYSTEMD_LIMITS_OPT" \
+        "$IPV6_OPT" \
         "$BBR_MODLOAD"
     # 删掉 system.conf.d drop-in 后 systemd 不会自动重读，要 daemon-reexec。
     # 它只重新执行 systemd 自身（PID 1 原地 re-exec），不影响正在跑的服务
@@ -4207,7 +4451,7 @@ rollback_tune() {
     # 停掉并删除 RPS/XPS 的开机应用单元
     if [ -f "$NIC_UNIT" ]; then
         systemctl disable --now "$(basename "$NIC_UNIT")" &>/dev/null
-        rm -f "$NIC_UNIT" "$NIC_APPLY" "$NICPLAN"
+        rm -f "$NIC_UNIT"
         systemctl daemon-reload &>/dev/null
         echo -e "  已移除开机应用单元 $(basename "$NIC_UNIT")"
     fi
@@ -4216,6 +4460,26 @@ rollback_tune() {
         rm -f "$NIC_DISPATCH"
         echo -e "  已移除 networkd-dispatcher 钩子"
     }
+    # [人工决策-2026-08-06 14:42:18] 重放脚本与 plan 的清理必须与 unit 解耦。
+    # 原先三者一起挂在 `if [ -f "$NIC_UNIT" ]` 下，而无 systemd 机器上 install_nic_unit
+    # 走降级路径：只写 nic.plan + nic-apply.sh、压根不装 unit（那个 if 恒假），
+    # 于是回退后两者都遗留。且降级提示明确让用户把 nic-apply 挂进 init 流程，
+    # 挂了的话下次开机还会继续重放队列设置——与「可完整回退」直接冲突。
+    # 顺序在 dispatcher 钩子之后：钩子 exec 的就是这个脚本，先摘钩子再删被执行体
+    if [ -f "$NIC_APPLY" ] || [ -f "$NICPLAN" ]; then
+        rm -f "$NIC_APPLY" "$NICPLAN"
+        echo -e "  已移除网卡重放脚本 $(basename "$NIC_APPLY") 与队列清单"
+        # 用户自己挂进启动链的那一行删不掉，明确告知（与 $SYSCTL_APPLY 同一口径）。
+        # WSL 的 [boot] command 能逐字读到，所以单独核一遍；其余 init 方式无法可靠判定
+        if is_wsl && [ -n "$(wsl_boot_command)" ]; then
+            case "$(wsl_boot_command)" in
+            *"$(basename "$NIC_APPLY")"*)
+                echo -e "  ${YELLOW}注意：/etc/wsl.conf 的 [boot] command 里还挂着它，请手动删掉那段${NC}"
+                echo -e "  ${YELLOW}      当前: command=$(wsl_boot_command)${NC}"
+                ;;
+            esac
+        fi
+    fi
 
     # qdisc 的运行时改动要还原。顺序是「先删 plan 再恢复」，否则 dispatcher 钩子
     # 可能在中途被触发、把刚删掉的设置又写回来。
@@ -4251,14 +4515,28 @@ rollback_tune() {
 
     # 顺序很关键：先让 sysctl --system 重新应用「还留在系统里的」配置文件
     # （包括刚还原回来的被接管文件），再逐个写回受管 key 的原始运行时值。
-    # 反过来做的话 --system 会把刚还原的值又覆盖掉
-    apply_sysctl
-    restore_managed_keys
+    # 反过来做的话 --system 会把刚还原的值又覆盖掉。
+    # [人工决策-2026-08-16 22:31:43] 缺 sysctl 时配置文件仍清理（重启后靠内核默认
+    # 自愈），但绝不报「回退完成」——运行时值一项都没写回却报成功 = 假回退
+    local runtime_ok=1
+    if ! apply_sysctl; then
+        runtime_ok=0
+    fi
+    if ! restore_managed_keys; then
+        runtime_ok=0
+    fi
 
-    echo -e "${GREEN}回退完成：配置文件已清理，受管参数已逐个还原到首次运行前的值${NC}"
+    if [ "$runtime_ok" = "1" ]; then
+        echo -e "${GREEN}回退完成：配置文件已清理，受管参数已逐个还原到首次运行前的值${NC}"
+    else
+        echo -e "${RED}回退未完整：配置文件已清理，但运行时值未能全部写回${NC}"
+        echo -e "  ${YELLOW}请确认 sysctl 可用（包名 procps-ng / procps）后重跑菜单 6，或重启让内核默认接管${NC}"
+    fi
     if [ -f "$ORIG_STATE" ]; then
         echo -e "  ${YELLOW}原始值快照保留在 $ORIG_STATE（卸载面板时才删除）${NC}"
     fi
+    # 运行时都写不回时，后面的遗留确认也读不到，跳过避免误导
+    [ "$runtime_ok" = "1" ] || return 1
     # ip_forward 遗留是安全问题，单独确认一次
     local fw
     fw=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
@@ -4269,6 +4547,19 @@ rollback_tune() {
             echo -e "  ${YELLOW}ip_forward 仍为 1，但快照显示本机运行前就是 1，属原状${NC}"
         else
             echo -e "  ${RED}警告: ip_forward 仍为 1 且未能还原，请手动执行 sysctl -w net.ipv4.ip_forward=0${NC}"
+            echo -e "  ${RED}      并检查 /etc/sysctl.d/ 与 /etc/sysctl.conf 里是否有别的文件也在设它${NC}"
+        fi
+    fi
+    # IPv6 遗留同样单独确认：用户可能本来就自己关着（那属原状），也可能是本面板
+    # 关了却没还原成功。两者要分开说——报错方向搞反会让用户去改本来就该那样的配置
+    if ipv6_disabled_now; then
+        local o6
+        o6=$(orig_value net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+        if [ "$o6" = "1" ]; then
+            echo -e "  ${YELLOW}IPv6 仍是关闭状态，但快照显示本机运行前就关着，属原状${NC}"
+        else
+            echo -e "  ${RED}警告: IPv6 仍处于关闭状态且未能还原${NC}"
+            echo -e "  ${RED}      手动恢复: sysctl -w net.ipv6.conf.all.disable_ipv6=0（default/lo 同理）${NC}"
             echo -e "  ${RED}      并检查 /etc/sysctl.d/ 与 /etc/sysctl.conf 里是否有别的文件也在设它${NC}"
         fi
     fi
@@ -4286,6 +4577,20 @@ while true; do
         st_ipv4="${GREEN}[已开启]${NC}"
     else
         st_ipv4="${RED}[未开启]${NC}"
+    fi
+    # IPv6 三态，与 BBR 同一口径：先判运行时值，再区分「配置在但没生效」。
+    # 只看文件在不在会漏掉无 systemd 机器重启后那种最误导人的状态。
+    # 第三态还要区分「本来就关着」——用户自己关的不该显示成本面板关的
+    # 标题跟着动作变：同一个键在已关闭时走恢复分支，写死「关闭 IPv6」会与实际行为相反
+    if ipv6_disabled_now; then
+        st_ipv6="${GREEN}[已关闭]${NC}"
+        lb_ipv6="恢复 IPv6"
+    elif [ -f "$IPV6_OPT" ]; then
+        st_ipv6="${YELLOW}[配置未生效]${NC}"
+        lb_ipv6="关闭 IPv6"
+    else
+        st_ipv6="${RED}[未关闭]${NC}"
+        lb_ipv6="关闭 IPv6"
     fi
     # BBR 三态。只判运行时值会漏掉最误导人的那种：配置文件写着 bbr、实际跑 cubic
     # （无 systemd 机器重启后的常态）。那种情况报「未开启」也不对——用户明明设过，
@@ -4357,18 +4662,19 @@ while true; do
     _hint=$(version_hint)
     [ -n "$_hint" ] && echo -e "           $_hint"
     echo -e "${YELLOW}==================================================${NC}"
-    echo -e "  ${CYAN}9. 一键全部优化 (1+2+3+4)${NC}"
+    echo -e "  ${CYAN}9. 一键全部优化${NC}"
     draw_line
-    echo -e "  1. IPv4 优先解析      -> $st_ipv4  [避免 IPv6 绕路导致的握手延迟]"
-    echo -e "  2. BBR + FQ           -> $st_bbr  [不因随机丢包降速，跨境链路必开]"
-    echo -e "  3. 内核参数调优       -> $st_sysctl  [保守档：不开转发，适合普通业务]"
-    echo -e "  4. 内核参数-中转档    -> $st_sysctl  [保守档 + IP 转发 + MSS Clamp]"
-    echo -e "  5. 网卡队列/RPS/XPS   -> $st_nic  [软中断分摊，含开机持久化]"
-    echo -e "  c. qdisc 立刻生效     -> $st_qdisc  [运行时改动。不改也可，重启即自动生效]"
+    echo -e "  1. IPv4 优先          $st_ipv4"
+    echo -e "  i. $lb_ipv6          $st_ipv6"
+    echo -e "  2. BBR + FQ           $st_bbr"
+    echo -e "  3. 内核参数调优       $st_sysctl"
+    echo -e "  4. 内核参数-中转档    $st_sysctl"
+    echo -e "  5. 网卡队列/RPS/XPS   $st_nic"
+    echo -e "  c. qdisc 立刻生效     $st_qdisc"
     draw_line
-    echo -e "  ${CYAN}8. 瓶颈诊断${NC}          [只读。判断调 sysctl 到底有没有用]"
-    echo -e "  ${CYAN}a. 调优效果测量${NC}      [只读。前后计数器增量对比]"
-    echo -e "  ${CYAN}b. MTU / PMTU 探测${NC}   [只读。查路径有没有 MTU 黑洞]"
+    echo -e "  ${CYAN}8. 瓶颈诊断${NC}"
+    echo -e "  ${CYAN}a. 调优效果测量${NC}"
+    echo -e "  ${CYAN}b. MTU / PMTU 探测${NC}"
     draw_line
     echo -e "  6. 回退全部优化"
     echo -e "  7. 更新脚本"
@@ -4387,11 +4693,19 @@ while true; do
     case "$opt" in
     9) run_all ;;
     1) set_ipv4_priority ;;
+    # 同一个键既关又开：已关闭时给恢复入口，避免用户为了开回来必须跑菜单 6
+    # （那会把 BBR/缓冲区等全部优化一起回退掉）
+    i | I)
+        if ipv6_disabled_now; then
+            restore_ipv6
+        else
+            disable_ipv6
+        fi
+        ;;
     2) enable_bbr ;;
     3) PROFILE=normal tune_sysctl ;;
     4)
-        echo -e "\n${YELLOW}中转档会额外开启 IP 转发并给 mangle FORWARD 加 MSS Clamp。${NC}"
-        echo -e "${YELLOW}只有中转 / 代理 / 隧道节点才需要——普通业务机开了等于把自己变成路由器。${NC}"
+        echo -e "\n${YELLOW}中转档会开启 IP 转发 + MSS Clamp，只有中转/代理/隧道节点需要。${NC}"
         read -p "确认使用中转档？[y/N]: " _c
         [[ "$_c" =~ ^[Yy]$ ]] && PROFILE=transit tune_sysctl || echo -e "${GREEN}已取消。${NC}"
         ;;

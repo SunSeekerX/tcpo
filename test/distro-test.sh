@@ -80,23 +80,162 @@ bash -n /usr/local/bin/tcpo && { pass=$((pass+1)); echo "  ok   bash -n 通过";
 naked=$(grep -nE '^[[:space:]]*sysctl --system' /usr/local/bin/tcpo |
     grep -v 'apply_sysctl' | grep -v 'APPLY_LOG' | wc -l)
 ck "无裸跑的 sysctl --system（必须走 apply_sysctl）" "$naked" "0"
+# busybox 的 sysctl 不认 --system：它打印 unrecognized option + 自己的帮助文本、
+# 一个参数都不应用，而退出码仍是 0，报错过滤又只捞到帮助文本里的字样 => 一路报「已生效」。
+# 判例（alpine:3.21 实测）：菜单 2/3/4 写的参数在 Alpine 上从来没被应用过，
+# 而面板显示已生效。过去没暴露是因为断言只查配置文件内容、不查运行时值
+ck "存在 sysctl --system 支持性判据" \
+    "$(grep -c '^sysctl_supports_system() {' /usr/local/bin/tcpo)" "1"
+ck "存在逐文件应用的降级路径" \
+    "$(grep -c '^apply_sysctl_files() {' /usr/local/bin/tcpo)" "1"
+_as=$(sed -n '/^apply_sysctl() {/,/^}/p' /usr/local/bin/tcpo | grep -vE '^[[:space:]]*#')
+ckhas "apply_sysctl 先判支持性再选路径" "$_as" 'if sysctl_supports_system; then'
+ckhas "不支持时走逐文件" "$_as" 'apply_sysctl_files'
+# 逐文件应用的顺序必须与 sysctl.d(5) 一致（按 basename 字典序、/etc 同名优先），
+# 否则本脚本 zz- 前缀「最后加载才赢」的前提不成立
+_asf=$(sed -n '/^apply_sysctl_files() {/,/^}/p' /usr/local/bin/tcpo | grep -vE '^[[:space:]]*#')
+ckhas "逐文件按 basename 排序" "$_asf" 'sort'
+ckhas "逐文件覆盖 vendor 目录" "$_asf" '/usr/lib/sysctl.d'
+# 本机若真的不支持 --system，直接验参数能不能落地——这是唯一能抓住上述缺陷的断言。
+# 前提必须是「sysctl 命令存在但不认 --system」（真 busybox），不能是「sysctl 根本没有」：
+# RHEL 系最小镜像不自带 procps-ng，sysctl --help 失败也会让 ! grep 为真，
+# 于是走进这条路径却应用不了任何东西，误报 FAIL（rockylinux:9 实测）
+if command -v sysctl >/dev/null 2>&1 &&
+    ! sysctl --help 2>&1 | grep -q -- '--system'; then
+    mkdir -p /etc/sysctl.d
+    echo "net.ipv4.tcp_fin_timeout = 17" > /etc/sysctl.d/zz-applytest.conf
+    _before=$(cat /proc/sys/net/ipv4/tcp_fin_timeout 2>/dev/null)
+    bash -c '
+        STATE_DIR=/tmp/_at; APPLY_LOG=/tmp/_at/apply.log; DRYRUN=0
+        RED=; GREEN=; YELLOW=; CYAN=; NC=; MANAGED_KEYS="net.ipv4.tcp_fin_timeout"
+        mkdir -p /tmp/_at
+        eval "$(sed -n "/^dryrun_skip() {/,/^}/p;/^sysctl_supports_system() {/,/^}/p;/^apply_sysctl_files() {/,/^}/p;/^apply_sysctl() {/,/^}/p" /usr/local/bin/tcpo)"
+        apply_sysctl >/dev/null 2>&1
+    '
+    ck "busybox 环境下配置真的被应用（$_before -> 17）" \
+        "$(cat /proc/sys/net/ipv4/tcp_fin_timeout 2>/dev/null)" "17"
+    rm -f /etc/sysctl.d/zz-applytest.conf
+    rm -rf /tmp/_at
+elif ! command -v sysctl >/dev/null 2>&1; then
+    echo "  note 本机无 sysctl 命令（后面菜单会自动装），跳过 busybox 实跑断言"
+else
+    echo "  note 本机 sysctl 支持 --system，跳过 busybox 降级路径的实跑断言"
+fi
 # 豁免那行必须真的落日志，否则等于静默吞掉开机时的内核报错
-gen_sysctl=$(sed -n '/^write_sysctl_apply()/,/^}/p' /usr/local/bin/tcpo | grep -E '^sysctl --system')
+# 豁免那行必须真的落日志，否则等于静默吞掉开机时的内核报错。
+# 判据允许缩进：busybox 降级后它在 if 分支里，不再是行首
+gen_sysctl=$(sed -n '/^write_sysctl_apply()/,/^}/p' /usr/local/bin/tcpo |
+    grep -E '^[[:space:]]*sysctl --system')
 case "$gen_sysctl" in
 *'>>$APPLY_LOG'*) pass=$((pass+1)); echo "  ok   重放脚本的 sysctl 输出落日志";;
 *'2>&1'*) fail=$((fail+1)); echo "  FAIL 重放脚本把 sysctl 报错丢弃了";;
-*) echo "  note 未取到重放脚本里的 sysctl 行，跳过";;
+*) fail=$((fail+1)); echo "  FAIL 未取到重放脚本里的 sysctl --system 行";;
 esac
+# 重放脚本必须自带 busybox 降级：它是独立文件，开机时调不到面板的 apply_sysctl_files
+_wsfn=$(sed -n '/^write_sysctl_apply() {/,/^}/p' /usr/local/bin/tcpo | grep -vE '^[[:space:]]*#')
+ckhas "重放脚本自判 --system 支持性" "$_wsfn" "sysctl --help"
+ckhas "重放脚本有 -p 降级路径" "$_wsfn" 'sysctl -p'
 [ "$naked" != "0" ] && grep -nE '^[[:space:]]*sysctl --system' /usr/local/bin/tcpo | sed 's/^/       /'
 
 # 机检：MANAGED_KEYS 与 OWNED_KEYS_RE 必须覆盖同一组参数，
-# 漏了就会出现「写进去了但回退不还原」或「被别的文件覆盖却不接管」
-mk_count=$(sed -n '/^MANAGED_KEYS="/,/^"/p' /usr/local/bin/tcpo | grep -c '^net\.')
+# 漏了就会出现「写进去了但回退不还原」或「被别的文件覆盖却不接管」。
+# 计数不能只匹配 ^net.：清单里还有 fs.nr_open，只认 net. 前缀时它掉了也不报错
+mk_count=$(sed -n '/^MANAGED_KEYS="/,/^"/p' /usr/local/bin/tcpo | grep -cE '^[a-z]+\.')
 if [ "$mk_count" -ge 20 ]; then
     pass=$((pass+1)); echo "  ok   MANAGED_KEYS 有 $mk_count 项受管 key"
 else
     fail=$((fail+1)); echo "  FAIL MANAGED_KEYS 只有 $mk_count 项，可能漏了参数"
 fi
+# fs.nr_open 必须受管：它是 limits.d / systemd 那两个 nofile 硬限的前提，
+# 不受管就会退回「跟着一个瞬时低值往下砍」的老行为（判例见 tcpo 句柄上限那段注释）
+ckhas "fs.nr_open 在受管清单里" "$(sed -n '/^MANAGED_KEYS="/,/^"/p' /usr/local/bin/tcpo)" 'fs.nr_open'
+ckhas "接管正则覆盖 fs.nr_open" "$(grep -m1 '^OWNED_KEYS_RE=' /usr/local/bin/tcpo)" 'fs\.nr_open'
+
+# --- 关闭 IPv6（菜单 i）的横切要求 ---
+# 三个 disable_ipv6 必须在 MANAGED_KEYS 里，否则菜单 6 不会写回运行时值：
+# 删掉 $IPV6_OPT 后 sysctl --system 对「已删除的 key」什么都不做（项目规则明写），
+# IPv6 会永久留在关闭状态而回退报成功
+_mk=$(sed -n '/^MANAGED_KEYS="/,/^"/p' /usr/local/bin/tcpo)
+for _k in all default lo; do
+    ckhas "net.ipv6.conf.$_k.disable_ipv6 在受管清单里" "$_mk" "net.ipv6.conf.$_k.disable_ipv6"
+done
+# IPV6_KEYS 与 MANAGED_KEYS 里的 ipv6 项必须同为 3 条，漏一条就有 key 回退不了
+_ik_count=$(sed -n '/^IPV6_KEYS="/,/^"/p' /usr/local/bin/tcpo | grep -c '^net\.ipv6\.')
+ck "IPV6_KEYS 恰为 3 项" "$_ik_count" "3"
+_mk_ipv6=$(printf '%s\n' "$_mk" | grep -c '^net\.ipv6\.')
+# 期望值钉死 3 而不是与 $_ik_count 互相比对：两边同时为 0 时「一致」恒真，
+# 那正是「两处都漏了」的情况，等于断言没写（反面注入时实测踩到）
+ck "MANAGED_KEYS 里 ipv6 项恰为 3（与 IPV6_KEYS 同组）" "$_mk_ipv6" "3"
+# IPv6 接管正则必须覆盖同一组，否则别的文件里设了 disable_ipv6=0 会把本项盖回去
+ckhas "IPv6 接管正则覆盖 all/default/lo" \
+    "$(grep -m1 '^IPV6_OWNED_RE=' /usr/local/bin/tcpo)" '(all|default|lo)'
+# 菜单 3/4 不该因为「别处设过 disable_ipv6」就去注释那些行——它与内核调优无关。
+# 判据：主接管正则里不许出现 ipv6.conf，那组只由菜单 i 用自己的正则接管
+ck "主接管正则不含 disable_ipv6" \
+    "$(grep -m1 '^OWNED_KEYS_RE=' /usr/local/bin/tcpo | grep -c 'disable_ipv6')" "0"
+# $IPV6_OPT 必须在回退的删除清单里，且纳入演练重定向（否则 TCPO_DRYRUN=1 会真的改机）
+ck "回退清理 IPV6_OPT" \
+    "$(sed -n '/^rollback_tune() {/,/^}/p' /usr/local/bin/tcpo | grep -c '"\$IPV6_OPT"')" "1"
+ckhas "IPV6_OPT 纳入演练重定向" "$(cat /usr/local/bin/tcpo)" 'IPV6_OPT="$DRYRUN_ROOT$IPV6_OPT"'
+# 三道拒绝闸必须都在：本项是唯一「最坏情况可能超出参数没生效」的写入项，
+# 关掉唯一的出口/当前 SSH 通路即失联无法自救，所以是硬拒绝而不是 y/N 确认
+_d6=$(sed -n '/^disable_ipv6() {/,/^}/p' /usr/local/bin/tcpo)
+ckhas "拒绝闸1 判 IPv6 SSH 会话" "$_d6" 'ssh_session_af'
+ckhas "拒绝闸2 判无 IPv4 默认路由" "$_d6" 'has_ipv6_default_route && ! has_ipv4_default_route'
+ckhas "拒绝闸3 判出口无 IPv4 地址" "$_d6" 'if ! egress_has_ipv4; then'
+# 信息不全时必须 fail-closed：缺 ip / SSH_CONNECTION 为空 都不能放行
+ckhas "缺 ip 命令时拒绝" "$_d6" '缺 ip 命令，无法确认 IPv4 管理通路'
+ckhas "SSH_CONNECTION 未知时 fail-closed" "$_d6" '无法确认当前会话的管理通路'
+# 三道闸必须是 return 1 直接退出，不能降级成「警告后继续问 y/N」——
+# 那等于把失联风险交给一次手滑。判据：闸门区到确认提示之间至少 4 处 return 1
+# （缺 ip / v6 ssh / 未知会话 / 无 v4 路由 / 无出口地址 等）
+_gate_returns=$(printf '%s\n' "$_d6" | sed -n '/ensure_tools ip/,/确认关闭 IPv6/p' | grep -c 'return 1')
+if [ "$_gate_returns" -ge 4 ]; then
+    pass=$((pass+1)); echo "  ok   拒绝闸都是硬退出（$_gate_returns 处 return 1）"
+else
+    fail=$((fail+1)); echo "  FAIL 拒绝闸不足 4 处硬退出（得到 $_gate_returns），失联风险可被一次手滑绕过"
+fi
+# 探测函数缺 ip 时必须当作「不安全」返回 1（fail-closed），不能 return 0 放行
+_r4=$(sed -n '/^has_ipv4_default_route() {/,/^}/p' /usr/local/bin/tcpo)
+ckhas "缺 ip 命令时当无路由（fail-closed）" "$_r4" 'command -v ip >/dev/null 2>&1 || return 1'
+_e4=$(sed -n '/^egress_has_ipv4() {/,/^}/p' /usr/local/bin/tcpo)
+ckhas "缺 ip 命令时当无地址（fail-closed）" "$_e4" 'command -v ip >/dev/null 2>&1 || return 1'
+# 单独恢复必须解开 IPv6 接管标记，否则用户原配置永久保持被注释
+ck "存在 restore_ipv6_takeovers" "$(grep -c '^restore_ipv6_takeovers() {' /usr/local/bin/tcpo)" "1"
+_r6=$(sed -n '/^restore_ipv6() {/,/^}/p' /usr/local/bin/tcpo)
+ckhas "恢复 IPv6 时解开接管标记" "$_r6" 'restore_ipv6_takeovers'
+ckhas "恢复失败不报完成" "$_r6" '恢复未完整'
+ckhas "恢复检查接管返回值" "$_r6" 'restore_ipv6_takeovers ||'
+# 卸载在回退失败时必须保留脚本与状态目录
+_un=$(sed -n '/^uninstall_script() {/,/^}/p' /usr/local/bin/tcpo)
+ckhas "卸载检查回退返回值" "$_un" 'if ! rollback_tune'
+ckhas "回退失败中止卸载" "$_un" '中止卸载'
+# 活跃 v6 SSH 端口来自 sshd 实际监听，不写死 22
+_ha=$(sed -n '/^has_active_ipv6_ssh() {/,/^}/p' /usr/local/bin/tcpo)
+ckhas "活跃 v6 SSH 查 sshd 监听" "$_ha" 'sshd'
+ck "活跃 v6 SSH 未写死 :22" \
+    "$(printf '%s\n' "$_ha" | grep -cE ':22\$|/:22')" "0"
+# 完整回退缺 sysctl 时不许报「回退完成」
+_rb=$(sed -n '/^rollback_tune() {/,/^}/p' /usr/local/bin/tcpo | grep -vE '^[[:space:]]*#')
+ckhas "回退检查 apply_sysctl 返回值" "$_rb" 'if ! apply_sysctl'
+ckhas "回退检查 restore_managed_keys 返回值" "$_rb" 'if ! restore_managed_keys'
+ckhas "回退失败不报完成" "$_rb" '回退未完整'
+# apply_sysctl 必须识别 command not found
+_as=$(sed -n '/^apply_sysctl() {/,/^}/p' /usr/local/bin/tcpo)
+ckhas "apply_sysctl 缺命令时中止" "$_as" 'command -v sysctl'
+ckhas "apply_sysctl 识别 not found" "$_as" 'not found'
+# 菜单 9 一键优化不许带上关闭 IPv6：关掉一整个协议族对别人是意外的语义变更
+ck "菜单9 不含关闭 IPv6" \
+    "$(sed -n '/^run_all() {/,/^}/p' /usr/local/bin/tcpo | grep -c 'disable_ipv6')" "0"
+# 老快照补齐只能针对显式声明的新增 key。判例（实测踩到）：按「快照里没这一行就补」
+# 遍历整个 MANAGED_KEYS 时，已跑过 tcpo 的机器上 netdev_budget=600 这类**调过的值**
+# 会被当成原始值写进快照，回退于是还原到调过的值——看起来成功、实际更糟
+_amo=$(sed -n '/^append_missing_originals() {/,/^}/p' /usr/local/bin/tcpo | grep -vE '^[[:space:]]*#')
+ck "补齐不遍历 MANAGED_KEYS" "$(printf '%s\n' "$_amo" | grep -c 'MANAGED_KEYS')" "0"
+ckhas "补齐按传入清单迭代" "$_amo" 'for k in $keys'
+ckhas "补齐由调用方传新增清单" \
+    "$(sed -n '/^save_original_values() {/,/^}/p' /usr/local/bin/tcpo)" \
+    'append_missing_originals "$NEW_MANAGED_KEYS"'
 
 # 机检：所有装包动作必须经 run_pkg（它套了 PKG_TIMEOUT）。
 # 源不可达时裸跑 apt/dnf 会挂很久，用户看不出在等什么也没法中断
@@ -306,9 +445,22 @@ ck "ORIG_STATE 走原子写" \
     "$(grep -vE '^[[:space:]]*#' /usr/local/bin/tcpo | grep -cE '^[[:space:]]*\}[[:space:]]*>"\$ORIG_STATE"')" "0"
 ck "TAKEOVER_LIST 不裸追加" \
     "$(grep -vE '^[[:space:]]*#' /usr/local/bin/tcpo | grep -cE '>>"\$TAKEOVER_LIST"')" "0"
-# 快照失败必须中止后续改动（备份失败不能"先改了再说"）
-ck "四个入口都在快照失败时中止" \
-    "$(grep -c 'save_original_values || {' /usr/local/bin/tcpo)" "4"
+# 快照失败必须中止后续改动（备份失败不能"先改了再说"）。
+# 判据从「恰好 N 个入口」改成「每个调用点都带中止」：钉死数量时新增一个写入入口
+# 就必然误报，逼着改数字而不是看实质——而实质是「有没有哪个调用点没中止」。
+# 判例：加菜单 i（关闭 IPv6）后入口变 5 个，旧断言报 FAIL 而代码其实是对的
+# 必须排掉函数定义行 `save_original_values() {`——它也以该名字开头，
+# 计进去会让「带中止的调用点数」永远差 1（本轮实测踩到，属项目规则里那类
+# 「断言匹配范围不精确造成的假报」）。只认缩进后紧跟换行或 || 的调用形式
+_sov_all=$(grep -cE '^[[:space:]]+save_original_values([[:space:]]|$)' /usr/local/bin/tcpo)
+_sov_guarded=$(grep -c '^[[:space:]]*save_original_values || {' /usr/local/bin/tcpo)
+ck "每个快照调用点都在失败时中止（共 $_sov_all 处）" "$_sov_guarded" "$_sov_all"
+# 下限兜底：调用点数量不该退化：一个都没匹配到时上面那条会「0=0」恒真（等于没测）
+if [ "$_sov_all" -ge 4 ]; then
+    pass=$((pass+1)); echo "  ok   快照调用点有 $_sov_all 处（改运行时值的入口都覆盖到）"
+else
+    fail=$((fail+1)); echo "  FAIL 只找到 $_sov_all 处快照调用点，可能有入口没先快照"
+fi
 
 # --- iptables 规则要有所有权标记 ---
 # 精确文本匹配删除有两个问题：参数一变就删不掉；无法区分用户自己加的同款规则。
@@ -325,10 +477,21 @@ ck "回退清理 systemd drop-in" "$(grep -c '"\$SYSTEMD_LIMITS_OPT" \\' /usr/lo
 ckhas "删完 drop-in 要 daemon-reexec" "$(cat /usr/local/bin/tcpo)" 'systemctl daemon-reexec'
 # 硬限不能超 fs.nr_open，超了 setrlimit 被内核拒绝（实测报 Operation not permitted）
 ckhas "nofile 受 fs.nr_open 约束" "$(cat /usr/local/bin/tcpo)" 'nr_open=$(sysctl -n fs.nr_open'
+# nr_open 自己也要被抬起来写进主配置，而不是被当成不可动的上限往下砍 nofile。
+# 判例：WSL2 上 nr_open 被外部降到 65536 时，旧写法把 DefaultLimitNOFILE 从发行版
+# 默认 1024:524288 写成 2048:65536，要求高 fd 的容器（ClickHouse）直接起不来
+ckhas "nr_open 走 sysctl_ceil 只升不降" "$(cat /usr/local/bin/tcpo)" 'v_nr_open=$(sysctl_ceil fs.nr_open 1048576)'
+ckhas "nr_open 写进主配置" "$(cat /usr/local/bin/tcpo)" 'fs.nr_open = ${v_nr_open}'
+ckhas "nofile 不低于现有 systemd 硬限" "$(cat /usr/local/bin/tcpo)" 'systemctl show -p DefaultLimitNOFILE --value'
 _nrq=$(sysctl -n fs.nr_open 2>/dev/null || echo 1048576)
 _nfw=$(grep -m1 '^\* hard nofile' /etc/security/limits.d/99-network-performance.conf 2>/dev/null | awk '{print $4}')
 if [ -n "$_nfw" ]; then
     ck "写出的 nofile 不超 nr_open" "$([ "$_nfw" -le "$_nrq" ] && echo 1 || echo 0)" "1"
+    # 反方向也要卡住：容器里 /proc/sys/fs 只读时 nofile 只能退到现值，但在 nr_open
+    # 可写的机器上必须真的抬到 1048576，否则等于这次修复没生效
+    if [ -w /proc/sys/fs/nr_open ]; then
+        ck "nr_open 可写时 nofile 抬到 1048576" "$_nfw" "1048576"
+    fi
 fi
 
 # --- sysctl 冲突扫描要覆盖 vendor 目录 ---
@@ -672,6 +835,24 @@ ckhas "NICPLAN 写失败中止" "$_tnfn" '开机重放清单没落地'
 ck "NICPLAN 不再裸重定向" \
     "$(printf '%s\n' "$_tnfn" | grep -vE '^[[:space:]]*#' | grep -c 'sort -u "\$plan_tmp" >"\$NICPLAN"')" "0"
 
+# --- 网卡重放脚本与 plan 的清理不能挂在 unit 存在上 ---
+# 判例：三者一起写在 `if [ -f "$NIC_UNIT" ]` 下，而无 systemd 机器上 install_nic_unit
+# 走降级路径——只写 nic.plan + nic-apply.sh、压根不装 unit，那个 if 恒假，
+# 于是回退后两者都遗留；降级提示还让用户把 nic-apply 挂进 init，挂了就会继续重放。
+# 判据锚到「删 NIC_APPLY/NICPLAN 的那一行不在 NIC_UNIT 的 if 块里」：
+# 取 rollback 函数体，截出 `if [ -f "$NIC_UNIT" ]` 到其 fi 之间的部分，里面不许出现它们
+_rbnic=$(sed -n '/^rollback_tune() {/,/^}/p' /usr/local/bin/tcpo | grep -vE '^[[:space:]]*#')
+_unitblk=$(printf '%s\n' "$_rbnic" | sed -n '/if \[ -f "\$NIC_UNIT" \]/,/^    fi$/p')
+ck "NIC_APPLY 清理不挂在 unit 块内" \
+    "$(printf '%s\n' "$_unitblk" | grep -c 'NIC_APPLY')" "0"
+ck "NICPLAN 清理不挂在 unit 块内" \
+    "$(printf '%s\n' "$_unitblk" | grep -c 'NICPLAN')" "0"
+# 且必须真的有一处独立清理（不能只是从 unit 块里删掉、没补回来）
+ckhas "回退独立清理 NIC_APPLY/NICPLAN" "$_rbnic" 'rm -f "$NIC_APPLY" "$NICPLAN"'
+# 用户挂进启动链的那行删不掉，要与 SYSCTL_APPLY 同一口径明确告知
+ck "nic-apply 的 WSL 挂载残留有提示" \
+    "$(printf '%s\n' "$_rbnic" | grep -c 'basename "\$NIC_APPLY"')" "2"
+
 # 通用机检要覆盖「其它命令重定向到大写变量」的形式，不只是 cat/printf。
 # 判例：NICPLAN 用的是 sort -u > "$NICPLAN"，逃过了只认 cat/printf 的旧判据
 _bareredir=$(grep -nE '^[[:space:]]*[a-z][a-z0-9_-]*([[:space:]]+-[^>]*)?[[:space:]]*>"\$[A-Z_]+"' /usr/local/bin/tcpo |
@@ -833,6 +1014,91 @@ ck "apply 脚本已生成" "$([ -x /usr/local/bin/tcp-dashboard-nic-apply.sh ] &
 bash /usr/local/bin/tcp-dashboard-nic-apply.sh && { pass=$((pass+1)); echo "  ok   apply 脚本独立可执行"; } \
     || { fail=$((fail+1)); echo "  FAIL apply 脚本执行失败"; }
 
+echo "--- 4b. 关闭 IPv6（菜单 i）---"
+# 容器里 net.ipv6.conf.* 通常在命名空间内可写（与 net.core.* 不同），所以运行时值也能验；
+# 读不到就只验配置文件内容，不把「容器限制」记成失败
+ipv6conf=/etc/sysctl.d/zz-disable-ipv6.conf
+# 拒绝闸要先单独验一遍：伪造一个 IPv6 SSH 会话，必须拒绝且一个字节都不写。
+# 这是本项唯一「最坏情况超出参数没生效」的风险点，只测正常路径等于没测
+rm -f "$ipv6conf"
+out=$(printf "i\ny\n\n0\n" |
+    SSH_CONNECTION="2001:db8::1 51000 2001:db8::2 22" bash /usr/local/bin/tcpo 2>&1 |
+    sed -e 's/\x1b\[[0-9;]*m//g')
+ckhas "IPv6 SSH 会话被拒绝" "$out" "当前 SSH 会话是通过 IPv6 连进来的"
+ck "拒绝后不写配置文件" "$([ -f "$ipv6conf" ] && echo 1 || echo 0)" "0"
+
+# 先埋一份用户自己的 disable_ipv6，再关——验证接管与恢复能完整还原
+cat >/etc/sysctl.d/50-user-ipv6.conf <<'U6'
+# 用户自己的 IPv6 配置，菜单 i 应接管再在恢复时解开
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv4.conf.all.log_martians = 1
+U6
+
+out=$(printf "i\ny\n\n0\n" | bash /usr/local/bin/tcpo 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g')
+if [ -f "$ipv6conf" ]; then
+    pass=$((pass+1)); echo "  ok   IPv6 配置文件已生成"
+    for _k in all default lo; do
+        ck "写了 net.ipv6.conf.$_k.disable_ipv6 = 1" \
+            "$(grep -c "^net.ipv6.conf.$_k.disable_ipv6 = 1" "$ipv6conf")" "1"
+    done
+    # 快照必须含这三项，否则回退写不回原值（删文件不等于回退）
+    for _k in all default lo; do
+        ck "快照含 net.ipv6.conf.$_k.disable_ipv6" \
+            "$(awk -F= -v kk="net.ipv6.conf.$_k.disable_ipv6" '$1==kk{print 1; exit}' \
+                /var/lib/tcp-dashboard/original-values 2>/dev/null)" "1"
+    done
+    if _v=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null); then
+        ck "运行时 all.disable_ipv6 已生效" "$_v" "1"
+    else
+        echo "  note net.ipv6.conf.* 在本容器读不到，跳过运行时断言"
+    fi
+    # 菜单 i 不该重写主配置：两者混在一起会让一次普通调优把「关了 IPv6」悄悄带走
+    ck "菜单 i 不碰主配置文件" "$(grep -c 'disable_ipv6' "$conf" 2>/dev/null)" "0"
+    # 接管：用户原行被注释、无关行不动
+    ck "接管后用户 disable_ipv6 被注释" \
+        "$(grep -c '^# moved to.*disable_ipv6' /etc/sysctl.d/50-user-ipv6.conf)" "1"
+    ck "接管后无关行保留" \
+        "$(grep -c '^net.ipv4.conf.all.log_martians = 1' /etc/sysctl.d/50-user-ipv6.conf)" "1"
+else
+    # 容器里 /proc/sys/net/ipv6 可能整个不存在（内核编译时关掉 IPv6），此时跳过而非记失败
+    if [ -d /proc/sys/net/ipv6 ]; then
+        fail=$((fail+1)); echo "  FAIL IPv6 配置文件未生成"
+    else
+        echo "  note 本内核无 IPv6 支持（/proc/sys/net/ipv6 不存在），跳过本段"
+    fi
+    rm -f /etc/sysctl.d/50-user-ipv6.conf
+fi
+
+# 单独恢复：同一个键在已关闭时必须走恢复分支，且只动 IPv6 不碰其他优化。
+# 前提是运行时值真的关掉了——状态判定读的是运行时值而非文件，容器命名空间外
+# （写得进文件、改不动内核）时该键仍显示未关闭、仍走关闭分支，那是正确行为不是缺陷。
+# 判例：rockylinux:9 最小镜像缺 sysctl 命令导致三个 key 全读不到，此处曾误报两条 FAIL
+_ipv6_live=0
+[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = "1" ] && _ipv6_live=1
+if [ -f "$ipv6conf" ] && [ "$_ipv6_live" = "1" ]; then
+    out=$(printf "i\ny\n\n0\n" | bash /usr/local/bin/tcpo 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g')
+    ckhas "已关闭时菜单 i 走恢复分支" "$out" "重新启用 IPv6"
+    ck "恢复后配置文件已删" "$([ -f "$ipv6conf" ] && echo 1 || echo 0)" "0"
+    # 恢复只该动 IPv6，主配置与 BBR 配置必须还在（否则用户为开回 IPv6 丢了全部调优）
+    ck "恢复不删主配置" "$([ -f "$conf" ] && echo 1 || echo 0)" "1"
+    if [ -f /etc/sysctl.d/50-user-ipv6.conf ]; then
+        ck "恢复后用户 disable_ipv6 已解开" \
+            "$(grep -c '^net.ipv6.conf.all.disable_ipv6 = 0' /etc/sysctl.d/50-user-ipv6.conf)" "1"
+        ck "恢复后无残留 IPv6 接管标记" \
+            "$(grep -c "moved to.*zz-disable-ipv6" /etc/sysctl.d/50-user-ipv6.conf)" "0"
+        ck "恢复后无关行仍在" \
+            "$(grep -c '^net.ipv4.conf.all.log_martians = 1' /etc/sysctl.d/50-user-ipv6.conf)" "1"
+        rm -f /etc/sysctl.d/50-user-ipv6.conf
+    fi
+    if _v=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null); then
+        ck "运行时 all.disable_ipv6 已写回 0" "$_v" "0"
+    fi
+    # 再关一次，留给第 7 段验菜单 6 的整体回退
+    printf "i\ny\n\n0\n" | bash /usr/local/bin/tcpo >/dev/null 2>&1
+elif [ -f "$ipv6conf" ]; then
+    echo "  note 运行时 disable_ipv6 未生效（命名空间外），跳过恢复分支断言"
+    rm -f /etc/sysctl.d/50-user-ipv6.conf
+fi
 echo "--- 5. 只读菜单不报错、且不装包 ---"
 # 只读菜单（8/a/b）对外承诺零副作用，所以它们不再自动装包——缺工具只提示怎么补装。
 # 这里先记录包状态，跑完只读菜单后核对没变（这是「零副作用」承诺的机检）
@@ -874,7 +1140,7 @@ sed -n '/^detect_pkg_mgr()/,/^}/p;/^pkg_for()/,/^}/p' /usr/local/bin/tcpo >/tmp/
 _bad=""
 _checked=0
 _pm=$(. /tmp/pkgmap.sh; detect_pkg_mgr 2>/dev/null)
-for _t in ss nstat tc ethtool ping tracepath iptables; do
+for _t in ss nstat tc ethtool ping tracepath iptables sysctl; do
     [ -n "$_pm" ] || break
     _pkg=$(. /tmp/pkgmap.sh; pkg_for "$_t" "$_pm" 2>/dev/null)
     [ -n "$_pkg" ] || { _bad="$_bad $_t(无映射)"; continue; }
@@ -932,9 +1198,29 @@ out=$(printf "6\n\n0\n" | bash /usr/local/bin/tcpo 2>&1)
 ckhas "回退有还原计数" "$out" "已还原"
 ck "主配置已删"     "$([ -f "$conf" ] && echo 1 || echo 0)" "0"
 ck "RFS drop-in 已删" "$([ -f /etc/sysctl.d/zz-network-rfs.conf ] && echo 1 || echo 0)" "0"
+# 关闭 IPv6 的 drop-in 也要删：菜单 6 承诺「还原成第一次运行前的样子」
+ck "IPv6 drop-in 已删" "$([ -f /etc/sysctl.d/zz-disable-ipv6.conf ] && echo 1 || echo 0)" "0"
+# 删文件不等于回退：sysctl --system 对已删除的 key 什么都不做，必须显式写回原值。
+# 快照原值为 0 时运行时值就必须回到 0，否则 IPv6 会永久关着而回退报成功
+o6=$(awk -F= '$1=="net.ipv6.conf.all.disable_ipv6"{print $2; exit}' \
+    /var/lib/tcp-dashboard/original-values 2>/dev/null)
+if [ "$o6" = "0" ]; then
+    if _v=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null); then
+        ck "IPv6 已还原为开启" "$_v" "0"
+    else
+        echo "  note net.ipv6.conf.* 读不到，跳过 IPv6 还原断言"
+    fi
+else
+    echo "  skip IPv6 原值为 ${o6:-未记录}（宿主本来就关着或无 IPv6）"
+fi
 # 无 systemd 环境生成的开机重放脚本也要删：留着会在开机时跑一个指向已删配置的孤儿脚本，
 # 不符合「可完整回退」
 ck "开机重放脚本已删" "$([ -f /usr/local/bin/tcp-dashboard-sysctl-apply.sh ] && echo 1 || echo 0)" "0"
+# 网卡重放脚本与 plan 同理，且这两样在无 systemd 机器上是没有 unit 的
+# （install_nic_unit 走降级路径只写它们），清理若挂在 unit 存在上就会遗留。
+# 这条在有/无 systemd 的镜像上都要成立——前者经 unit 块之外的独立清理，后者本来就没 unit
+ck "网卡重放脚本已删" "$([ -f /usr/local/bin/tcp-dashboard-nic-apply.sh ] && echo 1 || echo 0)" "0"
+ck "网卡队列清单已删" "$([ -f /var/lib/tcp-dashboard/nic.plan ] && echo 1 || echo 0)" "0"
 ck "被接管文件复原" "$(grep -c '^net.core.somaxconn = 1024' /etc/sysctl.d/50-mixed.conf)" "1"
 ck "接管标记已清除" "$(grep -c '^# moved to' /etc/sysctl.d/50-mixed.conf)" "0"
 if [ -d /run/systemd/system ]; then

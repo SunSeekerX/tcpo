@@ -868,6 +868,137 @@ case "$rb" in
     *) ok "回退清理未被恒假条件绕过";;
 esac
 
+# --- 关闭 IPv6（菜单 i）的对外承诺必须由实现兑现 ---
+# 这是唯一「最坏情况可能超出参数没生效」的写入项：只有 IPv6 入口的机器关掉即自断 SSH。
+# 网页与 README 都写了「三道检查任一命中直接拒绝、不给确认选项」，那句话必须锁死到代码
+d6=$(sed -n '/^disable_ipv6()/,/^}/p' tcpo | strip_comments)
+case "$d6" in
+    *ssh_session_af*) ok "关闭 IPv6 前判当前 SSH 是否走 IPv6";;
+    *) no "未判 SSH 通路，IPv6 登录的机器会被自断连接（文案承诺了这道检查）";;
+esac
+case "$d6" in
+    *has_ipv4_default_route*) ok "关闭 IPv6 前判有无 IPv4 默认出口";;
+    *) no "未判 IPv4 默认路由，唯一出口是 v6 的机器会断网";;
+esac
+case "$d6" in
+    *egress_has_ipv4*) ok "关闭 IPv6 前判出口网卡有无 IPv4 地址";;
+    *) no "未判出口地址，只有 v6 地址的机器会失联";;
+esac
+# 信息不全时必须 fail-closed（缺 ip / SSH 未知 都拒绝），不能 return 0 放行
+case "$d6" in
+    *'无法确认 IPv4 管理通路'* | *'缺 ip 命令'*) ok "缺 ip 时拒绝关闭 IPv6";;
+    *) no "缺 ip 时未拒绝，探测不了管理通路却继续关 IPv6";;
+esac
+case "$d6" in
+    *'无法确认当前会话的管理通路'*) ok "SSH_CONNECTION 未知时 fail-closed";;
+    *) no "SSH 会话信息不全时未拒绝（tmux 丢环境 + 仅 v6 会失联）";;
+esac
+# 三道闸必须是硬拒绝。降级成「警告后照样问 y/N」等于把失联风险交给一次手滑，
+# 而文案明写「不给确认选项」——文案与实现不一致时要改代码，不是改文案
+if printf '%s\n' "$d6" | sed -n '/ensure_tools ip/,/确认关闭 IPv6/p' | grep -q 'return 1'; then
+    ok "拒绝闸是硬退出（不落到确认提示）"
+else
+    no "拒绝闸没有硬退出，风险可被一次确认绕过（与文案承诺不符）"
+fi
+# 单独恢复必须解开接管标记，否则用户原 disable_ipv6 行永久保持被注释
+r6=$(sed -n '/^restore_ipv6()/,/^}/p' tcpo | strip_comments)
+case "$r6" in
+    *restore_ipv6_takeovers*) ok "恢复 IPv6 时解开用户原配置的接管标记";;
+    *) no "恢复 IPv6 只删 drop-in 不解接管，用户原配置永久失效";;
+esac
+# 接管解开 / 写回失败时不许报「已恢复」
+case "$r6" in
+    *'恢复未完整'*) ok "恢复 IPv6 失败时不报完成";;
+    *) no "恢复 IPv6 不区分部分失败，运行时写成 0 就报成功";;
+esac
+case "$r6" in
+    *'restore_ipv6_takeovers ||'*) ok "恢复链路检查接管解开的返回值";;
+    *) no "恢复链路不检查 restore_ipv6_takeovers 返回值";;
+esac
+# 卸载在回退失败时必须保留脚本与快照
+un=$(sed -n '/^uninstall_script()/,/^}/p' tcpo | strip_comments)
+case "$un" in
+    *'if ! rollback_tune'*) ok "卸载检查回退返回值";;
+    *) no "卸载不检查 rollback_tune，回退失败仍会删脚本和快照";;
+esac
+case "$un" in
+    *'中止卸载'*) ok "回退失败时中止卸载";;
+    *) no "回退失败时仍继续卸载（快照与重试入口会一起丢）";;
+esac
+# 活跃 v6 SSH 兜底不能写死 22 端口
+ha=$(sed -n '/^has_active_ipv6_ssh()/,/^}/p' tcpo | strip_comments)
+case "$ha" in
+    *sshd*) ok "活跃 v6 SSH 按 sshd 实际监听端口判定";;
+    *) no "活跃 v6 SSH 未查 sshd 监听端口，自定义 Port 会被漏判";;
+esac
+case "$ha" in
+    *':22$'*) no "活跃 v6 SSH 仍写死 :22\$（自定义 Port 漏判）";;
+    *) ok "活跃 v6 SSH 未写死 22 端口";;
+esac
+# 完整回退缺 sysctl 时不许报成功
+rb2=$(sed -n '/^rollback_tune()/,/^}/p' tcpo | strip_comments)
+case "$rb2" in
+    *'回退未完整'*) ok "回退失败时不报「回退完成」";;
+    *) no "回退链路不区分运行时写回失败，会假报回退完成";;
+esac
+as=$(sed -n '/^apply_sysctl()/,/^}/p' tcpo | strip_comments)
+case "$as" in
+    *'command -v sysctl'*) ok "apply_sysctl 缺命令时中止";;
+    *) no "apply_sysctl 不查 sysctl 是否存在，command not found 会被当成功";;
+esac
+case "$as" in
+    *'not found'*) ok "apply_sysctl 报错过滤覆盖 not found";;
+    *) no "apply_sysctl 报错过滤漏掉 not found，缺命令时静默成功";;
+esac
+# 文档承诺「菜单 9 不含关闭 IPv6」，实现里 run_all 就不许调它
+ra=$(sed -n '/^run_all()/,/^}/p' tcpo | strip_comments)
+case "$ra" in
+    *disable_ipv6*) no "菜单 9 调了 disable_ipv6（文档承诺不含此项）";;
+    *) ok "菜单 9 不含关闭 IPv6（与文档一致）";;
+esac
+# 文档承诺「再按一次变成恢复」，主菜单就必须按运行时状态分派到两个函数
+menu6=$(sed -n '/^while true; do/,$p' tcpo | strip_comments)
+if printf '%s\n' "$menu6" | grep -q 'ipv6_disabled_now' &&
+    printf '%s\n' "$menu6" | grep -q 'restore_ipv6'; then
+    ok "菜单 i 按当前状态分派关闭/恢复（与文档一致）"
+else
+    no "菜单 i 未提供恢复入口，用户只能靠菜单 6 回退掉全部优化"
+fi
+# 回退要删 IPv6 drop-in，且不能只删文件——sysctl --system 对已删 key 什么都不做，
+# 必须靠 MANAGED_KEYS 里那三项写回运行时值，否则 IPv6 永久关着而回退报成功
+case "$rb" in
+    *'"$IPV6_OPT"'*) ok "回退清理 IPv6 drop-in";;
+    *) no "回退遗留 IPv6 drop-in（不符合可完整回退）";;
+esac
+mk6=$(sed -n '/^MANAGED_KEYS="/,/^"/p' tcpo | grep -c '^net\.ipv6\.conf\..*\.disable_ipv6$')
+ck "三个 disable_ipv6 都在受管清单（回退能写回运行时值）" "$mk6" "3"
+# sysctl 命令缺失时必须放弃改动：那种环境下快照会把每个 key 记成 ABSENT，
+# 回退于是静默跳过一切并报成功——比没有快照更糟（rockylinux:9 最小镜像实测）
+sov=$(sed -n '/^save_original_values()/,/^}/p' tcpo | strip_comments)
+# 判据必须锚到「读第一个值之前就带 return 1 的守卫」，不能只查函数里出现过
+# command -v sysctl：函数里本来就有第二次（补装后复查），把守卫改成 if false
+# 照样能被那处满足（本轮反面注入实测到的假绿）。
+# 取函数开头到首个 sysctl -n 之间的片段，要求其中同时有 command -v sysctl 与 return 1
+sov_head=$(printf '%s\n' "$sov" | sed -n '1,/sysctl -n/p')
+if printf '%s\n' "$sov_head" | grep -q 'command -v sysctl' &&
+    printf '%s\n' "$sov_head" | grep -q 'return 1'; then
+    ok "读原值之前就守住 sysctl 缺失并中止"
+else
+    no "缺 sysctl 时仍会写出全 ABSENT 的快照（回退会静默跳过一切）"
+fi
+case "$sov_head" in
+    *'ensure_tools sysctl'*) ok "缺 sysctl 时先尝试自动补装";;
+    *) no "缺 sysctl 时不补装，最小化 RHEL 上会直接拒绝改动";;
+esac
+# 守卫条件不能被恒假绕过。上面那条是文本匹配，分不清 `if ! command -v sysctl` 和
+# `if false`——把条件改成恒假后内层的 command -v / return 1 仍在片段里，断言照样过
+# （本轮反面注入实测）。与项目已有的「回退清理未被恒假条件绕过」同一套做法
+case "$sov_head" in
+    *'if false'* | *'if [ 1 -eq 0 ]'* | *'if [ 0 = 1 ]'*)
+        no "快照的 sysctl 守卫被恒假条件关掉（等于没守）";;
+    *) ok "快照的 sysctl 守卫未被恒假条件绕过";;
+esac
+
 echo "${CYAN}=== 4h. 状态标记读真实生效值 ===${NC}"
 # 判据必须是「配置文件写的 vs sysctl 实际读到的」，不能是「文件存在」。
 # 判例：WSL 重启后配置文件都在、参数全是原值，只看文件存在会报「已开启」
