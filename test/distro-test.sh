@@ -82,7 +82,7 @@ naked=$(grep -nE '^[[:space:]]*sysctl --system' /usr/local/bin/tcpo |
 ck "无裸跑的 sysctl --system（必须走 apply_sysctl）" "$naked" "0"
 # busybox 的 sysctl 不认 --system：它打印 unrecognized option + 自己的帮助文本、
 # 一个参数都不应用，而退出码仍是 0，报错过滤又只捞到帮助文本里的字样 => 一路报「已生效」。
-# 判例（alpine:3.21 实测）：菜单 2/3/4 写的参数在 Alpine 上从来没被应用过，
+# 判例（alpine:3.21 实测）：菜单 4/5/6 写的参数在 Alpine 上从来没被应用过，
 # 而面板显示已生效。过去没暴露是因为断言只查配置文件内容、不查运行时值
 ck "存在 sysctl --system 支持性判据" \
     "$(grep -c '^sysctl_supports_system() {' /usr/local/bin/tcpo)" "1"
@@ -151,8 +151,8 @@ fi
 ckhas "fs.nr_open 在受管清单里" "$(sed -n '/^MANAGED_KEYS="/,/^"/p' /usr/local/bin/tcpo)" 'fs.nr_open'
 ckhas "接管正则覆盖 fs.nr_open" "$(grep -m1 '^OWNED_KEYS_RE=' /usr/local/bin/tcpo)" 'fs\.nr_open'
 
-# --- 关闭 IPv6（菜单 i）的横切要求 ---
-# 三个 disable_ipv6 必须在 MANAGED_KEYS 里，否则菜单 6 不会写回运行时值：
+# --- 关闭 IPv6（菜单 3）的横切要求 ---
+# 三个 disable_ipv6 必须在 MANAGED_KEYS 里，否则菜单 30 不会写回运行时值：
 # 删掉 $IPV6_OPT 后 sysctl --system 对「已删除的 key」什么都不做（项目规则明写），
 # IPv6 会永久留在关闭状态而回退报成功
 _mk=$(sed -n '/^MANAGED_KEYS="/,/^"/p' /usr/local/bin/tcpo)
@@ -169,8 +169,8 @@ ck "MANAGED_KEYS 里 ipv6 项恰为 3（与 IPV6_KEYS 同组）" "$_mk_ipv6" "3"
 # IPv6 接管正则必须覆盖同一组，否则别的文件里设了 disable_ipv6=0 会把本项盖回去
 ckhas "IPv6 接管正则覆盖 all/default/lo" \
     "$(grep -m1 '^IPV6_OWNED_RE=' /usr/local/bin/tcpo)" '(all|default|lo)'
-# 菜单 3/4 不该因为「别处设过 disable_ipv6」就去注释那些行——它与内核调优无关。
-# 判据：主接管正则里不许出现 ipv6.conf，那组只由菜单 i 用自己的正则接管
+# 菜单 5/6 不该因为「别处设过 disable_ipv6」就去注释那些行——它与内核调优无关。
+# 判据：主接管正则里不许出现 ipv6.conf，那组只由菜单 3 用自己的正则接管
 ck "主接管正则不含 disable_ipv6" \
     "$(grep -m1 '^OWNED_KEYS_RE=' /usr/local/bin/tcpo | grep -c 'disable_ipv6')" "0"
 # $IPV6_OPT 必须在回退的删除清单里，且纳入演练重定向（否则 TCPO_DRYRUN=1 会真的改机）
@@ -224,7 +224,7 @@ ckhas "回退失败不报完成" "$_rb" '回退未完整'
 _as=$(sed -n '/^apply_sysctl() {/,/^}/p' /usr/local/bin/tcpo)
 ckhas "apply_sysctl 缺命令时中止" "$_as" 'command -v sysctl'
 ckhas "apply_sysctl 识别 not found" "$_as" 'not found'
-# 菜单 9 一键优化不许带上关闭 IPv6：关掉一整个协议族对别人是意外的语义变更
+# 菜单 1 一键优化不许带上关闭 IPv6：关掉一整个协议族对别人是意外的语义变更
 ck "菜单9 不含关闭 IPv6" \
     "$(sed -n '/^run_all() {/,/^}/p' /usr/local/bin/tcpo | grep -c 'disable_ipv6')" "0"
 # 老快照补齐只能针对显式声明的新增 key。判例（实测踩到）：按「快照里没这一行就补」
@@ -448,7 +448,7 @@ ck "TAKEOVER_LIST 不裸追加" \
 # 快照失败必须中止后续改动（备份失败不能"先改了再说"）。
 # 判据从「恰好 N 个入口」改成「每个调用点都带中止」：钉死数量时新增一个写入入口
 # 就必然误报，逼着改数字而不是看实质——而实质是「有没有哪个调用点没中止」。
-# 判例：加菜单 i（关闭 IPv6）后入口变 5 个，旧断言报 FAIL 而代码其实是对的
+# 判例：加菜单 3（关闭 IPv6）后入口变 5 个，旧断言报 FAIL 而代码其实是对的
 # 必须排掉函数定义行 `save_original_values() {`——它也以该名字开头，
 # 计进去会让「带中止的调用点数」永远差 1（本轮实测踩到，属项目规则里那类
 # 「断言匹配范围不精确造成的假报」）。只认缩进后紧跟换行或 || 的调用形式
@@ -530,7 +530,7 @@ for _k in '缓冲区推导链' 'BDP  ' 'x2.5 余量' '内存 5%' 'TCP 全局池'
 done
 
 # --- tcp_mtu_probing 是唯一一个设了却没有验证手段的参数 ---
-# 菜单 3 设 tcp_mtu_probing=1、菜单 b 做 ICMP 阶梯，但都是「我们主动去探」。
+# 菜单 5 设 tcp_mtu_probing=1、菜单 22 做 ICMP 阶梯，但都是「我们主动去探」。
 # 这两个计数器反映真实业务连接遇到的情况，非零就是「路径确有黑洞且参数在起作用」
 ckhas "验证 MTU 探测真触发过" "$(cat /usr/local/bin/tcpo)" 'TcpExtTCPMTUPSuccess'
 ckhas "MTU 探测失败也计数" "$(cat /usr/local/bin/tcpo)" 'TcpExtTCPMTUPFail'
@@ -608,7 +608,7 @@ rm -rf "$_sd"
 
 # --- qdisc 丢包必须累加全部队列，且只留一处实现 ---
 # mq 设备第一处 dropped 是 root 汇总（常为 0），实际丢包在叶子上。
-# 判例：diagnose 修好了但 counter_snapshot 漏改，于是菜单 8 报得对、菜单 a 在多队列
+# 判例：diagnose 修好了但 counter_snapshot 漏改，于是菜单 20 报得对、菜单 21 在多队列
 # 机器上仍读成 0。抽成公共函数后同一份判据只有一处实现，不会再漂移
 ck "存在 qdisc_drops 函数" "$(grep -c '^qdisc_drops() {' /usr/local/bin/tcpo)" "1"
 ck "无残留的取首处 dropped 写法" \
@@ -629,7 +629,7 @@ _qsum=$(printf '%s\n' "$_tcs" | awk '{ while (match($0, /dropped [0-9]+/)) {
 ck "mq 叶子丢包累加" "$_qsum" "42"
 
 # --- gai.conf 必须纳入演练重定向与链接防护 ---
-# 判例：set_ipv4_priority 原先硬编码 /etc/gai.conf，TCPO_DRYRUN=1 跑菜单 1 会真实改机，
+# 判例：set_ipv4_priority 原先硬编码 /etc/gai.conf，TCPO_DRYRUN=1 跑菜单 2 会真实改机，
 # 与「零写入」承诺直接冲突；且 gai.conf 是链接时会跟着写到目标
 ck "gai.conf 有路径常量" "$(grep -c '^GAI_CONF=' /usr/local/bin/tcpo)" "1"
 ckhas "gai.conf 纳入演练重定向" "$(cat /usr/local/bin/tcpo)" 'GAI_CONF="$DRYRUN_ROOT$GAI_CONF"'
@@ -691,8 +691,8 @@ fi
 # write_sysctl_apply 单独点名：它写的是 root 执行的脚本，是这类问题里危害最大的
 ckhas "write_sysctl_apply 查链接" "$(sed -n '/^write_sysctl_apply() {/,/^}/p' /usr/local/bin/tcpo)" 'refuse_if_symlink "$SYSCTL_APPLY" || return 1'
 
-# --- BBR 重放条件必须覆盖「只跑菜单 3/4」这条路径 ---
-# 判例：modprobe 的条件是 [ -f $BBR_OPT ]，而菜单 3/4 把 tcp_congestion_control=bbr
+# --- BBR 重放条件必须覆盖「只跑菜单 5/6」这条路径 ---
+# 判例：modprobe 的条件是 [ -f $BBR_OPT ]，而菜单 5/6 把 tcp_congestion_control=bbr
 # 写进的是主配置文件——那时 BBR_OPT 不存在，modprobe 不执行，重启后内核静默拒绝
 # bbr 回到 cubic；bbr_persist_note 也因同一个条件不介入，用户拿不到任何提示
 ck "重放脚本 modprobe 不只看 BBR_OPT" \
@@ -761,7 +761,7 @@ ck "RFS 写盘不用 && 链" \
 # 判据来源：strings systemd-modules-load 得到五个目录（/etc、/run、/usr/local/lib、
 # /usr/lib、/lib）。man 的 SYNOPSIS 只列了三个，但同页 DESCRIPTION 提到 /usr/local/lib，
 # 二进制字符串是权威。漏掉 /usr/local/lib 会让那里提供的 tcp_bbr 被误判成
-# 「开机没人加载」，于是菜单 2/3/4 报错误告警并多生成一份不需要的重放脚本
+# 「开机没人加载」，于是菜单 4/5/6 报错误告警并多生成一份不需要的重放脚本
 _mlfn=$(sed -n '/^modules_load_has_bbr() {/,/^}/p' /usr/local/bin/tcpo)
 for _d in /etc/modules-load.d /usr/local/lib/modules-load.d /usr/lib/modules-load.d /lib/modules-load.d; do
     ckhas "modules-load 覆盖 $_d" "$_mlfn" "$_d/*.conf"
@@ -866,12 +866,12 @@ else
     printf '%s\n' "$_bareredir" | sed 's/^/       /'
 fi
 
-# --- 菜单 3/4 在 systemd 机器上必须自动闭环 BBR ---
+# --- 菜单 5/6 在 systemd 机器上必须自动闭环 BBR ---
 # 判例：主配置写了 tcp_congestion_control=bbr，但 tcp_bbr 是模块且开机无人加载时
 # 只给人工命令，且外层已经先打印了绿色「配置持久化于」——两条同屏出现自相矛盾，
 # 而只跑 3/4 的 systemd 主机重启后确实会静默回到 cubic
 ck "存在 write_bbr_modload" "$(grep -c '^write_bbr_modload() {' /usr/local/bin/tcpo)" "1"
-# 两处共用同一实现（菜单 2 与 bbr_persist_note），不重复写
+# 两处共用同一实现（菜单 4 与 bbr_persist_note），不重复写
 ck "modload 写入只有一处实现" \
     "$(grep -c "printf 'tcp_bbr" /usr/local/bin/tcpo)" "1"
 ckhas "systemd 分支自动补齐" "$_bpn" 'if write_bbr_modload; then'
@@ -1014,7 +1014,7 @@ ck "apply 脚本已生成" "$([ -x /usr/local/bin/tcp-dashboard-nic-apply.sh ] &
 bash /usr/local/bin/tcp-dashboard-nic-apply.sh && { pass=$((pass+1)); echo "  ok   apply 脚本独立可执行"; } \
     || { fail=$((fail+1)); echo "  FAIL apply 脚本执行失败"; }
 
-echo "--- 4b. 关闭 IPv6（菜单 i）---"
+echo "--- 4b. 关闭 IPv6（菜单 3）---"
 # 容器里 net.ipv6.conf.* 通常在命名空间内可写（与 net.core.* 不同），所以运行时值也能验；
 # 读不到就只验配置文件内容，不把「容器限制」记成失败
 ipv6conf=/etc/sysctl.d/zz-disable-ipv6.conf
@@ -1029,7 +1029,7 @@ ck "拒绝后不写配置文件" "$([ -f "$ipv6conf" ] && echo 1 || echo 0)" "0"
 
 # 先埋一份用户自己的 disable_ipv6，再关——验证接管与恢复能完整还原
 cat >/etc/sysctl.d/50-user-ipv6.conf <<'U6'
-# 用户自己的 IPv6 配置，菜单 i 应接管再在恢复时解开
+# 用户自己的 IPv6 配置，菜单 3 应接管再在恢复时解开
 net.ipv6.conf.all.disable_ipv6 = 0
 net.ipv4.conf.all.log_martians = 1
 U6
@@ -1052,8 +1052,8 @@ if [ -f "$ipv6conf" ]; then
     else
         echo "  note net.ipv6.conf.* 在本容器读不到，跳过运行时断言"
     fi
-    # 菜单 i 不该重写主配置：两者混在一起会让一次普通调优把「关了 IPv6」悄悄带走
-    ck "菜单 i 不碰主配置文件" "$(grep -c 'disable_ipv6' "$conf" 2>/dev/null)" "0"
+    # 菜单 3 不该重写主配置：两者混在一起会让一次普通调优把「关了 IPv6」悄悄带走
+    ck "菜单 3 不碰主配置文件" "$(grep -c 'disable_ipv6' "$conf" 2>/dev/null)" "0"
     # 接管：用户原行被注释、无关行不动
     ck "接管后用户 disable_ipv6 被注释" \
         "$(grep -c '^# moved to.*disable_ipv6' /etc/sysctl.d/50-user-ipv6.conf)" "1"
@@ -1077,7 +1077,7 @@ _ipv6_live=0
 [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = "1" ] && _ipv6_live=1
 if [ -f "$ipv6conf" ] && [ "$_ipv6_live" = "1" ]; then
     out=$(printf "i\ny\n\n0\n" | bash /usr/local/bin/tcpo 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g')
-    ckhas "已关闭时菜单 i 走恢复分支" "$out" "重新启用 IPv6"
+    ckhas "已关闭时菜单 3 走恢复分支" "$out" "重新启用 IPv6"
     ck "恢复后配置文件已删" "$([ -f "$ipv6conf" ] && echo 1 || echo 0)" "0"
     # 恢复只该动 IPv6，主配置与 BBR 配置必须还在（否则用户为开回 IPv6 丢了全部调优）
     ck "恢复不删主配置" "$([ -f "$conf" ] && echo 1 || echo 0)" "1"
@@ -1093,14 +1093,14 @@ if [ -f "$ipv6conf" ] && [ "$_ipv6_live" = "1" ]; then
     if _v=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null); then
         ck "运行时 all.disable_ipv6 已写回 0" "$_v" "0"
     fi
-    # 再关一次，留给第 7 段验菜单 6 的整体回退
+    # 再关一次，留给第 7 段验菜单 30 的整体回退
     printf "i\ny\n\n0\n" | bash /usr/local/bin/tcpo >/dev/null 2>&1
 elif [ -f "$ipv6conf" ]; then
     echo "  note 运行时 disable_ipv6 未生效（命名空间外），跳过恢复分支断言"
     rm -f /etc/sysctl.d/50-user-ipv6.conf
 fi
 echo "--- 5. 只读菜单不报错、且不装包 ---"
-# 只读菜单（8/a/b）对外承诺零副作用，所以它们不再自动装包——缺工具只提示怎么补装。
+# 只读菜单（20/21/22）对外承诺零副作用，所以它们不再自动装包——缺工具只提示怎么补装。
 # 这里先记录包状态，跑完只读菜单后核对没变（这是「零副作用」承诺的机检）
 _pkgs_before=$(
     { dpkg -l 2>/dev/null | grep -c '^ii' ||
@@ -1115,7 +1115,7 @@ _pkgs_after=$(
         apk info 2>/dev/null | wc -l ||
         pacman -Q 2>/dev/null | wc -l; } | head -1
 )
-ck "只读菜单 8 没装任何包" "$_pkgs_after" "$_pkgs_before"
+ck "只读菜单 20 没装任何包" "$_pkgs_after" "$_pkgs_before"
 # 缺工具时必须说明缺了什么、怎么补，而不是静默跳过
 out8=$(printf "8\n\n0\n" | bash /usr/local/bin/tcpo 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g')
 case "$out8" in
@@ -1179,7 +1179,7 @@ for m in 8 a b; do
         pass=$((pass+1)); echo "  ok   菜单 $m 无 shell 错误"
     fi
 done
-# 菜单 b 是只读功能，不会自动装 ping/tracepath（零副作用承诺）。
+# 菜单 22 是只读功能，不会自动装 ping/tracepath（零副作用承诺）。
 # 「tracepath 在 Debian 系是独立包 iputils-tracepath」这个包名易错点
 # 改由第 5 段的「补装提示的包名在本发行版真实存在」覆盖
 
@@ -1198,7 +1198,7 @@ out=$(printf "6\n\n0\n" | bash /usr/local/bin/tcpo 2>&1)
 ckhas "回退有还原计数" "$out" "已还原"
 ck "主配置已删"     "$([ -f "$conf" ] && echo 1 || echo 0)" "0"
 ck "RFS drop-in 已删" "$([ -f /etc/sysctl.d/zz-network-rfs.conf ] && echo 1 || echo 0)" "0"
-# 关闭 IPv6 的 drop-in 也要删：菜单 6 承诺「还原成第一次运行前的样子」
+# 关闭 IPv6 的 drop-in 也要删：菜单 30 承诺「还原成第一次运行前的样子」
 ck "IPv6 drop-in 已删" "$([ -f /etc/sysctl.d/zz-disable-ipv6.conf ] && echo 1 || echo 0)" "0"
 # 删文件不等于回退：sysctl --system 对已删除的 key 什么都不做，必须显式写回原值。
 # 快照原值为 0 时运行时值就必须回到 0，否则 IPv6 会永久关着而回退报成功
@@ -1294,6 +1294,15 @@ OUTEREOF
         fi
     fi
 done
+
+
+echo ""
+echo "${CYAN}--- shape/sweep 横切（宿主机静态）---${NC}"
+ck "SHAPE_SCRIPT 为路径常量" "$(grep -c '^SHAPE_SCRIPT=' tcpo)" "1"
+ck "存在 sweep_policer" "$(grep -c '^sweep_policer() {' tcpo)" "1"
+ck "存在 shape_apply" "$(grep -c '^shape_apply() {' tcpo)" "1"
+_n=$(sed -n '/^rollback_tune() {/,/^}/p' tcpo | grep -cE 'SHAPE_(UNIT|SCRIPT|RATE)')
+[ "$_n" -ge 1 ] && ok "回退清理整形产物" || no "回退未清理整形产物"
 
 echo ""
 echo "${YELLOW}==================== 汇总 ====================${NC}"

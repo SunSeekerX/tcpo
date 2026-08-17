@@ -31,7 +31,7 @@ pipeline {
 
                     # 上线白名单。加文件必须同步改这里——漏改只是网页少个资源，
                     # 多发反而会把 README/CLAUDE.md/test/ 之类的内部文件挂到公网
-                    PUBLISH="index.html style.css tcpo VERSION"
+                    PUBLISH="index.html tcpo VERSION"
 
                     # 门 1: CRLF。NTFS 下开发极易漂成 CRLF，shebang 后带 \\r 会让脚本在 Linux 上直接跑不起来
                     for f in $PUBLISH; do
@@ -149,7 +149,7 @@ pipeline {
                                                     trap - INT TERM
                                                     # 换入后核对产物都在位: 少了 tcpo 等于分发地址返 404、已安装用户自更新会失败,
                                                     # 少了 VERSION 则版本检查静默失效(拉不到就当「未知」, 不报错)
-                                                    if [ -s index.html ] && [ -s style.css ] && [ -s tcpo ] && [ -s VERSION ]; then
+                                                    if [ -s index.html ] && [ -s tcpo ] && [ -s VERSION ]; then
                                                         rm -rf _new_release dist.tar.gz
                                                         echo "已发布: \$(ls -1 | tr '\\n' ' ')"
                                                     else

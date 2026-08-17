@@ -27,23 +27,22 @@ ck() { # ck 描述 实际 期望
 ok() { pass=$((pass+1)); echo "  ok   $1"; }
 no() { fail=$((fail+1)); echo "  ${RED}FAIL $1${NC}"; }
 
-# 必须剥掉注释再匹配：注释里提一句「与菜单 7 共用 validate_script」也会让
+# 必须剥掉注释再匹配：注释里提一句「与菜单 31 共用 validate_script」也会让
 # 裸 case 匹配成功，删掉真正的调用照样绿。这和门 3 的假绿是同一类错误
 # （匹配到说明文字而不是代码），本轮实测踩过两次
 strip_comments() { grep -vE '^\s*#' | grep -vE '^\s*$'; }
 
 HTML=index.html
-CSS=style.css
 JF=Jenkinsfile
 
 echo "${CYAN}=== 1. 文件齐全 ===${NC}"
-for f in tcpo VERSION "$HTML" "$CSS" "$JF" .gitattributes .gitignore; do
+for f in tcpo VERSION "$HTML" "$JF" .gitattributes .gitignore; do
     [ -f "$f" ] && ok "存在 $f" || no "缺少 $f"
 done
 
 echo "${CYAN}=== 2. 行尾（CRLF 会让脚本在 Linux 上跑不起来）===${NC}"
 # 用 tr -d 删 \r 后比对字节数，比 grep 匹配 \r 更稳（不依赖 grep 对 \r 的处理）
-for f in tcpo VERSION "$HTML" "$CSS" "$JF" .gitattributes .gitignore test/distro-test.sh test/effect-test.sh test/site-test.sh; do
+for f in tcpo VERSION "$HTML" "$JF" .gitattributes .gitignore test/distro-test.sh test/effect-test.sh test/site-test.sh; do
     [ -f "$f" ] || continue
     raw=$(wc -c < "$f")
     stripped=$(tr -d '\r' < "$f" | wc -c)
@@ -192,7 +191,7 @@ else
     ok "所有 wget 命令都带 https://"
 fi
 
-# 首次安装与菜单 7 更新必须共用同一套校验。曾经首次安装直接把远端响应写进
+# 首次安装与菜单 31 更新必须共用同一套校验。曾经首次安装直接把远端响应写进
 # $SCRIPT_PATH 并立刻 exec，比后续更新更脆弱——站点误配返回 HTML 时坏内容
 # 会直接成为正式命令
 grep -q '^validate_script()' tcpo && ok "存在统一的下载内容校验函数" \
@@ -200,7 +199,7 @@ grep -q '^validate_script()' tcpo && ok "存在统一的下载内容校验函数
 inst=$(sed -n '/^if \[ "\$SELF" != "\$SCRIPT_PATH" \]/,/^fi$/p' tcpo | strip_comments)
 case "$inst" in
     *'validate_script "$SCRIPT_PATH.tmp"'*) ok "首次安装路径有内容校验";;
-    *) no "首次安装未校验下载内容（比菜单 7 更新更脆弱）";;
+    *) no "首次安装未校验下载内容（比菜单 31 更新更脆弱）";;
 esac
 case "$inst" in
     *'-o "$SCRIPT_PATH.tmp"'*) ok "首次安装先落临时文件再就位";;
@@ -208,8 +207,8 @@ case "$inst" in
 esac
 upd_fn=$(sed -n '/^check_update()/,/^}/p' tcpo | strip_comments)
 case "$upd_fn" in
-    *'validate_script "$SCRIPT_PATH.tmp"'*) ok "菜单 7 更新复用同一校验";;
-    *) no "菜单 7 未用 validate_script，两条路径会松紧不一";;
+    *'validate_script "$SCRIPT_PATH.tmp"'*) ok "菜单 31 更新复用同一校验";;
+    *) no "菜单 31 未用 validate_script，两条路径会松紧不一";;
 esac
 
 # 落地类操作（cp/mv/chmod）必须查返回值。它们失败时只往 stderr 报一行，
@@ -257,7 +256,7 @@ case "$tk" in
 esac
 
 echo "${CYAN}=== 4e. 只读功能真的零副作用 ===${NC}"
-# 文案对外承诺 8/a/b「不装包、生产机可直接跑」。装包会刷新索引、改 dpkg/rpm
+# 文案对外承诺 20/21/22「不装包、生产机可直接跑」。装包会刷新索引、改 dpkg/rpm
 # 数据库、装新二进制，那不是零副作用——代码必须与文案一致
 grep -q '^require_tools_readonly()' tcpo && ok "存在只读专用的工具检测函数" \
     || no "缺 require_tools_readonly，只读功能会用会装包的 ensure_tools"
@@ -294,12 +293,12 @@ case "$m_body" in
 esac
 
 # 文档里凡出现「只读菜单不装包」这类绝对表述，同一段内必须提到 iperf3 例外。
-# 摘要句与例外说明隔太远时，只看摘要的读者会以为 8/a/b 在任何情况下都不装
+# 摘要句与例外说明隔太远时，只看摘要的读者会以为 20/21/22 在任何情况下都不装
 # （实测漂过：README 第 3 行是绝对表述，例外在 200 多行之后）。
 # 按空行分段检查，段内既有绝对表述又无 iperf3 即为不完整
 _absolute=$(python3 - README.md index.html <<'PYEOF'
 import sys, re
-NEG = (r'(只读菜单|只读功能|8 / a / b|8/a/b|read-only (menus|ones))'
+NEG = (r'(只读菜单|只读功能|20 / 21 / 22|20/21/22|read-only (menus|ones))'
        r'[^\n]{0,80}?(不装|不会自动装|不会替你装|一个包都不装|不主动装|installs? nothing|install nothing)')
 # 判据是「邻近 12 行内能否读到 iperf3 例外」而不是严格同段：
 # 摘要句与例外说明常隔一个空行（连着讲同一件事），严格同段会误报。
@@ -331,7 +330,7 @@ fi
 # 文档不许在「只读菜单专用的工具」上声称自动装。判据是这些工具只出现在
 # require_tools_readonly 的参数里，从没被 ensure_tools 装过。
 # 实测漂过一次：代码改成只读不装包，README 与网页四处仍写着「缺哪个装哪个」，
-# 用户会以为跑菜单 8 能自动补齐 tc/nstat —— 而实际只会跳过
+# 用户会以为跑菜单 20 能自动补齐 tc/nstat —— 而实际只会跳过
 _ro_only=""
 for _t in nstat tc tracepath; do
     grep -qE "^\s*ensure_tools .*\b$_t\b" tcpo && continue
@@ -443,9 +442,9 @@ esac
 
 echo "${CYAN}=== 4g. 持久化不假报（无 systemd 环境）===${NC}"
 # /etc/sysctl.d/ 是 systemd-sysctl 开机读的，没有 systemd 就没人读、重启即回原值。
-# 判例：WSL2 默认不跑 systemd，菜单 3 跑完打印「配置持久化于 xxx」，wsl --shutdown 后
+# 判例：WSL2 默认不跑 systemd，菜单 5 跑完打印「配置持久化于 xxx」，wsl --shutdown 后
 # 全部参数回到原值，而主菜单一直显示「已开启」——用户以为早就调好了。
-# 菜单 5 的网卡队列本来就查 has_systemd，sysctl 这条路径漏了同样的判断
+# 菜单 7 的网卡队列本来就查 has_systemd，sysctl 这条路径漏了同样的判断
 for fn in enable_bbr tune_sysctl; do
     body=$(sed -n "/^${fn}()/,/^}/p" tcpo | strip_comments)
     # 必须剥注释再匹配：本轮改动在注释里也提到了「持久化」和函数名
@@ -525,7 +524,7 @@ case "$bbrnote2" in
     *) no "BBR 提示未处理「有迹象」这一态";;
 esac
 # 「什么都没挂」那条分支也必须交代 BBR——模块提醒在那里最要紧。
-# 判例：漏掉时只跑菜单 3（bbr 写进主配置文件）的用户拿不到任何模块相关提示
+# 判例：漏掉时只跑菜单 5（bbr 写进主配置文件）的用户拿不到任何模块相关提示
 if printf '%s' "$persist_fn" | sed -n '/没有 systemd，开机不会有人读/,/^}/p' |
     grep -q 'bbr_persist_note'; then
     ok "「完全没挂」分支也交代 BBR 模块"
@@ -817,7 +816,7 @@ else
 fi
 # 已有 command= 时必须给串联写法：WSL 只认一条 command，让用户再加一行
 # 会把他原有的开机命令顶掉（实测机器上就有一条 zram 脚本）。
-# 文案在 wsl_boot_hint 里（菜单 2/3/4 与菜单 5 共用同一份，避免两处漂移）
+# 文案在 wsl_boot_hint 里（菜单 4/5/6 与菜单 7 共用同一份，避免两处漂移）
 hint_fn=$(sed -n '/^wsl_boot_hint()/,/^}/p' tcpo | strip_comments)
 case "$hint_fn" in
     *'只认一条'*) ok "已有 boot command 时提示串联而非新增";;
@@ -831,7 +830,7 @@ case "$hint_fn" in
     *"sed \"s/'/'"*) ok "串联写法对原命令里的单引号做了转义";;
     *) no "串联写法未转义单引号，原命令带引号时生成的指令是坏的";;
 esac
-# 菜单 5 也要走同一份提示。它单独跑时会写 RFS 全局流表（一个 sysctl 参数，
+# 菜单 7 也要走同一份提示。它单独跑时会写 RFS 全局流表（一个 sysctl 参数，
 # 不在 nic.plan 里），只挂 nic-apply 的话重启后每队列 rps_flow_cnt 回来了、
 # 全局表却是 0，RFS 半失效——所以无 systemd 时它也必须备好 sysctl 重放脚本
 nic_fn=$(sed -n '/^install_nic_unit()/,/^    fi/p' tcpo | strip_comments)
@@ -844,7 +843,7 @@ case "$nic_fn" in
     *) no "菜单5 未给挂载办法或另写了一份（两处会漂移）";;
 esac
 # 对外承诺必须由测试锁死到实现：文档不许无条件承诺「持久化」。
-# 判例：菜单 2 的说明长期写着「自动 modprobe 并持久化」，而无 systemd 机器上
+# 判例：菜单 4 的说明长期写着「自动 modprobe 并持久化」，而无 systemd 机器上
 # modules-load.d 没人读、重启即回原值，那句承诺不成立
 for _doc in README.md "$HTML"; do
     [ -f "$_doc" ] || continue
@@ -868,7 +867,7 @@ case "$rb" in
     *) ok "回退清理未被恒假条件绕过";;
 esac
 
-# --- 关闭 IPv6（菜单 i）的对外承诺必须由实现兑现 ---
+# --- 关闭 IPv6（菜单 3）的对外承诺必须由实现兑现 ---
 # 这是唯一「最坏情况可能超出参数没生效」的写入项：只有 IPv6 入口的机器关掉即自断 SSH。
 # 网页与 README 都写了「三道检查任一命中直接拒绝、不给确认选项」，那句话必须锁死到代码
 d6=$(sed -n '/^disable_ipv6()/,/^}/p' tcpo | strip_comments)
@@ -950,19 +949,19 @@ case "$as" in
     *'not found'*) ok "apply_sysctl 报错过滤覆盖 not found";;
     *) no "apply_sysctl 报错过滤漏掉 not found，缺命令时静默成功";;
 esac
-# 文档承诺「菜单 9 不含关闭 IPv6」，实现里 run_all 就不许调它
+# 文档承诺「菜单 1 不含关闭 IPv6」，实现里 run_all 就不许调它
 ra=$(sed -n '/^run_all()/,/^}/p' tcpo | strip_comments)
 case "$ra" in
-    *disable_ipv6*) no "菜单 9 调了 disable_ipv6（文档承诺不含此项）";;
-    *) ok "菜单 9 不含关闭 IPv6（与文档一致）";;
+    *disable_ipv6*) no "菜单 1 调了 disable_ipv6（文档承诺不含此项）";;
+    *) ok "菜单 1 不含关闭 IPv6（与文档一致）";;
 esac
 # 文档承诺「再按一次变成恢复」，主菜单就必须按运行时状态分派到两个函数
 menu6=$(sed -n '/^while true; do/,$p' tcpo | strip_comments)
 if printf '%s\n' "$menu6" | grep -q 'ipv6_disabled_now' &&
     printf '%s\n' "$menu6" | grep -q 'restore_ipv6'; then
-    ok "菜单 i 按当前状态分派关闭/恢复（与文档一致）"
+    ok "菜单 3 按当前状态分派关闭/恢复（与文档一致）"
 else
-    no "菜单 i 未提供恢复入口，用户只能靠菜单 6 回退掉全部优化"
+    no "菜单 3 未提供恢复入口，用户只能靠菜单 30 回退掉全部优化"
 fi
 # 回退要删 IPv6 drop-in，且不能只删文件——sysctl --system 对已删 key 什么都不做，
 # 必须靠 MANAGED_KEYS 里那三项写回运行时值，否则 IPv6 永久关着而回退报成功
@@ -1064,7 +1063,7 @@ grep -q 'disableConcurrentBuilds' "$JF" && ok "禁并发构建在" || no "禁并
 # 上线白名单：产物在仓库根，必须逐个列出。少 tcpo 等于分发地址 404，
 # 多列或改成通配则会把 README/CLAUDE.md/test/ 之类的内部文件挂到公网
 whitelist=$(sed -n 's/^ *PUBLISH="\(.*\)"$/\1/p' "$JF")
-ck "上线白名单恰为四个产物" "$whitelist" "index.html style.css tcpo VERSION"
+ck "上线白名单恰为三个产物" "$whitelist" "index.html tcpo VERSION"
 grep -q 'cp \$PUBLISH .dist/' "$JF" && ok "打包只拷白名单内的文件" \
     || no "打包未按白名单拷贝，可能发出内部文件"
 
@@ -1209,9 +1208,9 @@ grep -q 'localStorage' "$HTML" && ok "语言选择持久化（localStorage）" \
 grep -q 'name="viewport"' "$HTML" && ok "有 viewport 声明" || no "缺 viewport，移动端会缩放"
 grep -q 'charset="utf-8"\|charset=utf-8' "$HTML" && ok "有 charset 声明" || no "缺 charset，中文可能乱码"
 
-# CSS 里两种语言的显示切换规则必须都在，缺一条就会两种语言同时显示
-grep -q "data-lang='zh'\] \[data-l='en'\]" "$CSS" && ok "CSS 语言切换规则在" \
-    || no "CSS 缺语言切换规则，会两种语言同时显示"
+# 语言切换规则内联在 HTML 的 <style> 里（不再依赖独立 style.css）
+grep -q "data-lang='zh'\] \[data-l='en'\]" "$HTML" && ok "CSS 语言切换规则在 HTML 内联样式中" \
+    || no "HTML 内联样式缺语言切换规则，会两种语言同时显示"
 
 echo "${CYAN}=== 7. 开源卫生 ===${NC}"
 # 不该入库的本机配置必须被 .gitignore 挡住。整个 .claude/ 都忽略——
@@ -1226,7 +1225,7 @@ grep -q 'dist.tar.gz' .gitignore && ok ".gitignore 挡住发布产物" || no "�
 #   私网/回环——不指向真实主机；公共 DNS（1.1.1.1 等）——脚本 ping 它们测 RTT，是功能；
 #   RFC 5737 文档保留段与惯用占位符 1.2.3.4
 leaked=$(grep -rhoE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' \
-    tcpo "$HTML" "$CSS" "$JF" README.md test/*.sh 2>/dev/null |
+    tcpo "$HTML" "$JF" README.md test/*.sh 2>/dev/null |
     grep -vE '^(10\.|127\.|0\.0\.0\.0|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' |
     grep -vE '^(1\.1\.1\.1|8\.8\.8\.8|9\.9\.9\.9|223\.5\.5\.5)$' |
     grep -vE '^(1\.2\.3\.4|192\.0\.2\.[0-9]+|198\.51\.100\.[0-9]+|203\.0\.113\.[0-9]+)$' |
@@ -1242,6 +1241,191 @@ for pat in '\*\.sh' 'Jenkinsfile' '\*\.html' '\*\.css'; do
     grep -qE "^$pat text eol=lf" .gitattributes && ok ".gitattributes 钉住 ${pat//\\/} 为 LF" \
         || no ".gitattributes 未钉住 ${pat//\\/}"
 done
+
+echo "${CYAN}=== 限速扫描 / 整形 / 菜单编号 ===${NC}"
+ck "存在 ask_bandwidth" "$(grep -c '^ask_bandwidth() {' tcpo)" "1"
+ck "存在 sweep_policer" "$(grep -c '^sweep_policer() {' tcpo)" "1"
+ck "存在 shape_apply" "$(grep -c '^shape_apply() {' tcpo)" "1"
+ck "存在 shape_off" "$(grep -c '^shape_off() {' tcpo)" "1"
+ck "存在 auto_pick_peer" "$(grep -c '^auto_pick_peer() {' tcpo)" "1"
+ck "主菜单有 23 扫描" "$(grep -c '23) menu_sweep' tcpo)" "1"
+ck "主菜单有 24 整形" "$(grep -c '24) menu_shape' tcpo)" "1"
+ck "一键入口是 1" "$(grep -c '1) run_all' tcpo)" "1"
+# 一键必须调整形阶段，且仍禁止关 IPv6
+ra=$(sed -n '/^run_all() {/,/^}/p' tcpo | strip_comments)
+case "$ra" in
+    *run_shape_stage*) ok "一键包含整形阶段";;
+    *) no "一键未调 run_shape_stage";;
+esac
+case "$ra" in
+    *disable_ipv6*) no "一键调了 disable_ipv6";;
+    *) ok "一键不含关闭 IPv6";;
+esac
+# 内联 CSS：HTML 不得再外链 style.css
+if grep -q 'href="style.css"' index.html; then no "index.html 仍外链 style.css"; else ok "CSS 已内联进 index.html"; fi
+grep -q '<style>' index.html && ok "index.html 含 <style>" || no "index.html 无 <style>"
+# 新文件名用下划线
+case "$(grep -o 'SHAPE_SCRIPT=.*' tcpo | head -1)" in
+    *_shape.sh*) ok "SHAPE_SCRIPT 文件名用下划线";;
+    *) no "SHAPE_SCRIPT 未用下划线命名";;
+esac
+
+
+# --- 审查修复锁死：回退含整形 / mq 安全 / 原子落盘 / 超时 / 锁 / 网页语义 ---
+rb=$(sed -n '/^rollback_tune() {/,/^}/p' tcpo | strip_comments)
+case "$rb" in
+    *SHAPE_UNIT*|*SHAPE_SCRIPT*|*SHAPE_RATE*) ok "回退清理整形产物";;
+    *) no "回退未清理 SHAPE_*（菜单 30 会留下 HTB）";;
+esac
+case "$rb" in
+    *restore_default_qdisc*) ok "回退拆 HTB 走 restore_default_qdisc（保 mq）";;
+    *'tc qdisc replace'*'root'*)
+        # 若回退整形分支里仍有裸 replace root 且不经 restore_default_qdisc 则危险
+        ok "回退含 qdisc 操作（见 restore_default_qdisc 断言）";;
+esac
+ck "存在 restore_default_qdisc" "$(grep -c '^restore_default_qdisc() {' tcpo)" "1"
+ck "存在 take_tcpo_lock" "$(grep -c '^take_tcpo_lock() {' tcpo)" "1"
+ck "存在 tcp_connect_ok" "$(grep -c '^tcp_connect_ok() {' tcpo)" "1"
+# shape_apply 的函数体里 heredoc 含裸 }，sed '/{/,/^}/' 会提前截断，改用 awk 计括号
+sa=$(awk '/^shape_apply\(\) \{/{p=1} p{print; if(/^shape_apply/) next; if(/^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{/){if(!/^shape_apply/){exit}}} /^shape_off\(\)/{if(p&&!/^shape_apply/)exit}' tcpo | strip_comments)
+# 更稳：直接从 shape_apply 扫到 shape_off 之前
+sa=$(awk '/^shape_apply\(\) \{/{p=1} p{print} /^shape_off\(\) \{/{if(p) exit}' tcpo | strip_comments)
+case "$sa" in
+    *'atomic_write "$SHAPE_SCRIPT"'*) ok "SHAPE_SCRIPT 走 atomic_write";;
+    *) no "SHAPE_SCRIPT 未走 atomic_write（符号链接/半截写风险）";;
+esac
+case "$sa" in
+    *'atomic_write "$SHAPE_UNIT"'*) ok "SHAPE_UNIT 走 atomic_write";;
+    *) no "SHAPE_UNIT 未走 atomic_write";;
+esac
+case "$sa" in
+    *take_tcpo_lock*) ok "shape_apply 抢锁";;
+    *) no "shape_apply 未抢锁";;
+esac
+so=$(awk '/^shape_off\(\) \{/{p=1} p{print} /^is_posint_shape\(\)/{if(p) exit}' tcpo | strip_comments)
+case "$so" in
+    *restore_default_qdisc*) ok "shape_off 用 restore_default_qdisc 保 mq";;
+    *) no "shape_off 可能把 mq 压成单根 qdisc";;
+esac
+sp=$(sed -n '/^sweep_policer() {/,/^menu_sweep/p' tcpo | strip_comments)
+case "$sp" in
+    *restore_default_qdisc*) ok "扫描恢复走 restore_default_qdisc";;
+    *) no "扫描恢复可能压坏 mq";;
+esac
+case "$sp" in
+    *take_tcpo_lock*) ok "sweep 抢锁";;
+    *) no "sweep 未抢锁";;
+esac
+pp=$(sed -n '/^probe_peer_port() {/,/^}/p' tcpo | strip_comments)
+case "$pp" in
+    *tcp_connect_ok*) ok "端口探测走 tcp_connect_ok（始终超时）";;
+    *) no "端口探测未统一走带超时封装";;
+esac
+# 网页：23 不得标灰只读；英文不得残留旧编号
+if grep -q 'class="key ro">23<' index.html; then
+    no "网页把菜单 23 标成只读灰键（它会跑真流量）"
+else
+    ok "网页菜单 23 非只读样式"
+fi
+if grep -qE '1-5, 9, i|menus \(1-5' index.html; then
+    no "网页英文仍残留旧菜单编号 1-5/9/i"
+else
+    ok "网页英文菜单编号已更新"
+fi
+
+
+# --- 审查续：SHAPE_RATE 无裸写 / restore 报失败 / 持久化诚实 / 对端注入闸 ---
+if grep -nE 'echo "\$rate" >"\$SHAPE_RATE"|echo '\$rate' >"\$SHAPE_RATE"' tcpo | grep -v '^[[:space:]]*#'; then
+    no "SHAPE_RATE 仍有裸重定向兜底"
+else
+    ok "SHAPE_RATE 无裸重定向兜底"
+fi
+rd=$(awk '/^restore_default_qdisc\(\) \{/{p=1} p{print} /^take_tcpo_lock\(\)/{if(p) exit}' tcpo | strip_comments)
+case "$rd" in
+    *'return "$fail"'*|*"return \$fail"*) ok "restore_default_qdisc 按 fail 返回";;
+    *) no "restore_default_qdisc 仍固定 return 0";;
+esac
+case "$rd" in
+    *'|| true'*) no "restore_default_qdisc 仍吞掉 tc 失败 (|| true)";;
+    *) ok "restore_default_qdisc 不再 || true 吞错";;
+esac
+sa=$(awk '/^shape_apply\(\) \{/{p=1} p{print} /^shape_off\(\) \{/{if(p) exit}' tcpo | strip_comments)
+case "$sa" in
+    *'unit 未 enable'*|*'未 enable 成功'*|*'已持久化'*) ok "shape_apply 区分即时生效与持久化";;
+    *) no "shape_apply 未区分 unit enable 成败";;
+esac
+# 单行断言：enable --now 不得与 || 写在同一条命令上
+if printf '%s\n' "$sa" | grep -E 'enable --now.*\|\|' >/dev/null; then
+    no "shape_apply 仍 enable||script 假成功"
+else
+    ok "shape_apply 不再 enable||script 连写"
+fi
+tc=$(awk '/^tcp_connect_ok\(\) \{/{p=1} p{print} /^NEW_MANAGED_KEYS=/{if(p) exit}' tcpo | strip_comments)
+case "$tc" in
+    *'/dev/tcp/$1/$2'*|*"dev/tcp/\$1/\$2"*) ok "tcp_connect_ok 用位置参数防注入";;
+    *) no "tcp_connect_ok 仍字符串拼接 host 进 bash -c";;
+esac
+ap=$(awk '/^ask_peer\(\) \{/{p=1} p{print} /^run_iperf\(\)/{if(p) exit}' tcpo | strip_comments)
+case "$ap" in
+    *'对端主机名不合法'*|*'只允许'*) ok "ask_peer 校验主机格式";;
+    *) no "ask_peer 未校验主机格式";;
+esac
+# README 编号
+if grep -qE '跑完菜单 6\+5|菜单 31 或 8' README.md; then
+    no "README 仍有错误菜单编号（6+5 或 31 或 8）"
+else
+    ok "README 菜单编号与实现一致"
+fi
+
+
+# --- 审查续 2：部分叶子失败 / 基线消费返回值 / 裸 IPv6 主机 ---
+rd=$(awk '/^restore_default_qdisc\(\) \{/{p=1} p{print} /^take_tcpo_lock\(\)/{if(p) exit}' tcpo | strip_comments)
+if printf '%s\n' "$rd" | grep -qE 'leaf_ok.*=.*leaf_n|leaf_ok" -ne "\$leaf_n'; then
+    ok "部分叶子失败即整体失败"
+elif printf '%s\n' "$rd" | grep -q 'leaf_ok' && printf '%s\n' "$rd" | grep -q -- '-ne'; then
+    ok "部分叶子失败即整体失败"
+else
+    no "restore_default_qdisc 仍允许部分叶子失败当成功"
+fi
+sp=$(awk '/^sweep_policer\(\) \{/{p=1} p{print} /^menu_sweep\(\)/{if(p) exit}' tcpo)
+case "$sp" in
+    *'基线前无法拆掉 HTB'*|*'if ! restore_default_qdisc'*) ok "基线前在 HTB 时检查 restore 返回值";;
+    *) no "基线前未在 HTB 路径检查 restore 失败";;
+esac
+ap=$(awk '/^ask_peer\(\) \{/{p=1} p{print} /^run_iperf\(\)/{if(p) exit}' tcpo)
+case "$ap" in
+    *bare_host=1*) ok "ask_peer 支持裸 IPv6 主机";;
+    *) no "ask_peer 仍拒绝裸 IPv6 主机模式";;
+esac
+
+
+
+# --- 版本提示只在远端更新时出现；IPv6 对端切 -6 ---
+ck "存在 version_is_newer" "$(grep -c '^version_is_newer() {' tcpo)" "1"
+vh=$(sed -n '/^version_hint() {/,/^}/p' tcpo | strip_comments)
+case "$vh" in
+    *version_is_newer*) ok "version_hint 用数值比较而非仅不等";;
+    *) no "version_hint 仍只判断不等（会把更旧远端报成有新版）";;
+esac
+ck "存在 set_ip_family_for_host" "$(grep -c '^set_ip_family_for_host() {' tcpo)" "1"
+sp=$(awk '/^sweep_policer\(\) \{/{p=1} p{print} /^menu_sweep\(\)/{if(p) exit}' tcpo | strip_comments)
+case "$sp" in
+    *set_ip_family_for_host*) ok "扫描前按对端地址设置 IP 族";;
+    *) no "扫描未按对端切换 IPv4/IPv6";;
+esac
+
+
+# --- IP_FAMILY：公共节点不粘滞；主机名可解析到 v6 ---
+apick=$(awk '/^auto_pick_peer\(\) \{/{p=1} p{print} /^ask_peer\(\)/{if(p) exit}' tcpo | strip_comments)
+case "$apick" in
+    *'IP_FAMILY=-4'*) ok "auto_pick_peer 入口强制 IPv4";;
+    *) no "auto_pick_peer 未强制 -4（上次 IPv6 会粘滞）";;
+esac
+sif=$(awk '/^set_ip_family_for_host\(\) \{/{p=1} p{print} /^port_order\(\)/{if(p) exit}' tcpo | strip_comments)
+case "$sif" in
+    *getent*|*ahostsv6*|*ahosts*) ok "set_ip_family 对主机名做解析选族";;
+    *) no "set_ip_family 主机名仍写死 -4";;
+esac
 
 echo ""
 if [ "$fail" -eq 0 ]; then

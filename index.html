@@ -6,7 +6,453 @@
 <title>tcpo · 跨境链路内核调优面板</title>
 <meta name="description" content="面向跨境链路的 Linux 内核网络参数调优面板。纯 bash，无依赖，可完整回退。">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230d1117'/><text x='8' y='12' font-family='monospace' font-size='9' fill='%233fb950' text-anchor='middle'>to</text></svg>">
-<link rel="stylesheet" href="style.css">
+<style>
+/* 深色单页，正文圆润无衬线 + 命令等宽。
+   零外部资源：字体走系统栈，图标用 data URI SVG */
+
+:root {
+    --bg: #0d1117;
+    --bg-raised: #161b22;
+    --line: #30363d;
+    /* 正文压到 #c9d1d9：#e6edf3 在纯深底上对比度约 14:1，长文阅读发刺。
+       这个值仍有 11:1，远高于 WCAG AA 的 4.5:1，只是不再晃眼 */
+    --fg: #c9d1d9;
+    /* --fg-dim 只给真正的辅助信息（tagline、表头、分隔符） */
+    --fg-dim: #8b949e;
+    /* 补充说明段落用这一档：比正文暗、但比辅助色清楚，因为里面有实用信息 */
+    --fg-note: #adb7c2;
+    /* 强调文字（<b>）比正文亮一档即可，用纯白会让加粗处跳出来打断阅读 */
+    --fg-strong: #e6edf3;
+    --accent: #3fb950;
+    --accent-dim: #238636;
+    /* 面板里三态状态标记的对应色，与脚本的 GREEN/YELLOW/RED 一致，
+       让网页上的说明和用户在终端里看到的颜色对得上 */
+    --warn: #d29922;
+    --bad: #f85149;
+    color-scheme: dark;
+
+    /* 正文用圆润无衬线，命令与参数名仍走 --mono。
+       全部是系统自带字体：本项目不引外部资源，Google Fonts 之类一律不用。
+       排序思路——先各平台的圆体（苹果 ui-rounded、鸿蒙、苹方、雅黑），
+       再回落 system-ui。Quicksand/Comfortaa 那类几何圆体不在系统里，写了也是空落 */
+    --sans: ui-rounded, 'SF Pro Rounded', -apple-system, BlinkMacSystemFont,
+        'Segoe UI Variable Display', 'Segoe UI', 'PingFang SC', 'HarmonyOS Sans SC',
+        'Hiragino Sans GB', 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+        'DejaVu Sans Mono', 'Noto Sans Mono CJK SC', monospace;
+
+    /* 圆角收口成两档，跟圆体字形呼应。小块（行内 code、按键）用 r-sm，
+       容器（命令框、代码块、语言切换）用 r-md */
+    --r-sm: 6px;
+    --r-md: 10px;
+}
+
+/* 语言切换：由 <html data-lang> 控制，两份文案都在 DOM 里 */
+[data-lang='zh'] [data-l='en'],
+[data-lang='en'] [data-l='zh'] {
+    display: none;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: 15.5px;
+    /* 圆体字面偏大、笔画偏粗，行高比等宽再松一点才不显拥挤 */
+    line-height: 1.8;
+    /* 移动端横屏时不放大字号 */
+    -webkit-text-size-adjust: 100%;
+}
+
+main {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 3rem 1.25rem 4rem;
+}
+
+/* --- 语言切换 --- */
+
+nav.lang {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    display: flex;
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    /* 胶囊形，与菜单按键块同一套语言 */
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+nav.lang button {
+    /* 胶囊两端是圆的，水平内边距要比方角时大一点，文字才不贴边 */
+    padding: 0.3rem 0.85rem;
+    border: 0;
+    background: var(--bg-raised);
+    color: var(--fg-dim);
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+nav.lang button:hover {
+    color: var(--fg);
+}
+
+[data-lang='zh'] nav.lang button[data-set-lang='zh'],
+[data-lang='en'] nav.lang button[data-set-lang='en'] {
+    background: var(--accent-dim);
+    color: #fff;
+}
+
+/* --- 头部 --- */
+
+header {
+    margin-bottom: 2.5rem;
+}
+
+h1 {
+    margin: 0;
+    /* 站名是要照着敲的命令，用等宽 */
+    font-family: var(--mono);
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+
+h1::before {
+    content: '$ ';
+    color: var(--accent);
+    font-weight: 400;
+}
+
+.tagline {
+    margin: 0.5rem 0 0;
+    color: var(--fg-dim);
+    font-size: 14.5px;
+}
+
+/* --- 通用排版 --- */
+
+h2 {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    margin: 0 0 1rem;
+    padding-bottom: 0.55rem;
+    border-bottom: 1px solid var(--line);
+    font-size: 1.18rem;
+    font-weight: 700;
+}
+
+/* 原来是 Markdown 的 "# " 前缀，配圆体正文太硬。
+   换成一个圆角色块，用 flex 对齐而不是 inline 字符——
+   字符前缀在中英文切换时基线会跳 */
+h2::before {
+    content: '';
+    flex: 0 0 auto;
+    width: 4px;
+    height: 1.05em;
+    border-radius: 2px;
+    background: var(--accent);
+}
+
+section {
+    margin-bottom: 2.75rem;
+}
+
+p {
+    margin: 0 0 1rem;
+}
+
+ul {
+    margin: 0 0 1rem;
+    padding-left: 1.2rem;
+}
+
+li {
+    margin-bottom: 0.6rem;
+}
+
+li::marker {
+    color: var(--accent);
+}
+
+a {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+}
+
+a:hover {
+    border-bottom-color: var(--accent);
+}
+
+b {
+    color: var(--fg-strong);
+    font-weight: 600;
+}
+
+/* 命令、参数名、路径一律等宽：圆体里 l/1/I 和 O/0 难分辨，
+   而这页面全是要照抄进终端的东西，抄错一个字符就是另一回事 */
+code,
+pre,
+kbd,
+samp {
+    font-family: var(--mono);
+}
+
+code {
+    padding: 0.12em 0.4em;
+    border-radius: var(--r-sm);
+    /* 比 --bg-raised 再亮一点：正文压暗后，行内代码用同色底就分不出来了。
+       容器级的 pre/.cmd 仍用 --bg-raised，层次是「正文 < 行内码 < 容器」 */
+    background: #1c2129;
+    color: var(--fg-strong);
+    /* 等宽字面比圆体小，同字号下看着偏小，回调一点 */
+    font-size: 0.93em;
+    /* 长路径（/usr/local/bin/tcpo）必须能断行，否则窄屏横向溢出；
+       但 break-all 会把 Ctrl-D 这类短标记也拆开（实测拆成 "Ct" / "rl-D"）。
+       anywhere 的断点选择跟 break-all 一样宽，但配合 max-content 的
+       min-width 计算会优先保住短词——再加 nowrap 兜底短标记 */
+    overflow-wrap: anywhere;
+    word-break: normal;
+}
+
+pre {
+    margin: 0 0 1rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--bg-raised);
+    overflow-x: auto;
+    /* 代码块内不需要正文那么松的行距 */
+    line-height: 1.65;
+}
+
+pre code {
+    padding: 0;
+    background: none;
+    word-break: normal;
+}
+
+/* 补充说明。用 --fg-note 而不是 --fg-dim：这些段落里有 wget 写法、
+   引号为什么必须加之类的实用信息，弱化到辅助色就没人读了。
+   14.5px 是下限——再小圆体的中文字面会糊 */
+.hint {
+    color: var(--fg-note);
+    font-size: 14.5px;
+}
+
+.note {
+    margin: 0.4rem 0 0;
+    color: var(--fg-note);
+    font-size: 14.5px;
+}
+
+/* --- 一键命令 --- */
+
+.cmd {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    margin-bottom: 0.75rem;
+    border: 1px solid var(--accent-dim);
+    border-radius: var(--r-md);
+    background: var(--bg-raised);
+    overflow: hidden;
+}
+
+.cmd code {
+    flex: 1;
+    min-width: 0;
+    padding: 0.85rem 1rem;
+    background: none;
+    font-size: 15px;
+    /* 窄屏优先横滚而不是折行：命令折行会让人以为要敲两行 */
+    overflow-x: auto;
+    white-space: nowrap;
+    word-break: normal;
+}
+
+.cmd code::before {
+    content: '$ ';
+    color: var(--accent);
+}
+
+.cmd button {
+    flex-shrink: 0;
+    padding: 0 1.1rem;
+    border: 0;
+    border-left: 1px solid var(--accent-dim);
+    background: var(--accent-dim);
+    color: #fff;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.cmd button:hover {
+    background: var(--accent);
+}
+
+/* 复制反馈：类名切换，两种语言的文案都跟着走 */
+.cmd button .done,
+.cmd button.copied .idle {
+    display: none;
+}
+
+.cmd button.copied .done {
+    display: inline;
+}
+
+[data-lang='zh'] .cmd button .done[data-l='en'],
+[data-lang='en'] .cmd button .done[data-l='zh'] {
+    display: none;
+}
+
+/* --- 菜单表 --- */
+
+dl.menu {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.45rem 0.9rem;
+    margin: 0 0 1rem;
+}
+
+dl.menu dt {
+    text-align: center;
+}
+
+dl.menu dd {
+    margin: 0;
+}
+
+.key {
+    display: inline-block;
+    min-width: 2.6em;
+    padding: 0 0.45em;
+    border: 1px solid var(--accent-dim);
+    /* 胶囊形，跟圆体呼应。这是「照着敲的键」，用等宽避免圆体里 1/l、0/O 混淆 */
+    border-radius: 999px;
+    background: var(--bg-raised);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-weight: 600;
+}
+
+/* 只读功能用灰边区分：零副作用，生产机可跑 */
+.key.ro {
+    border-color: var(--line);
+    color: var(--fg-dim);
+}
+
+/* --- 实测数据表 --- */
+
+.scroll {
+    margin-bottom: 1rem;
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+th,
+td {
+    padding: 0.5rem 0.7rem;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+    vertical-align: top;
+}
+
+th {
+    color: var(--fg-dim);
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+td.gain {
+    color: var(--accent);
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+/* --- 面板状态标记（正文里引用终端上的三态显示）--- */
+
+.ok,
+.warn,
+.bad {
+    font-family: var(--mono);
+    white-space: nowrap;
+}
+
+.ok {
+    color: var(--accent);
+}
+
+.warn {
+    color: var(--warn);
+}
+
+.bad {
+    color: var(--bad);
+}
+
+/* --- 页脚 --- */
+
+footer {
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--line);
+    font-size: 14px;
+}
+
+footer p {
+    margin: 0 0 0.5rem;
+}
+
+.sep {
+    margin: 0 0.5rem;
+    color: var(--fg-dim);
+}
+
+/* --- 窄屏 --- */
+
+@media (max-width: 560px) {
+    main {
+        padding: 3.5rem 1rem 3rem;
+    }
+
+    h1 {
+        font-size: 1.5rem;
+    }
+
+    /* 复制按钮换到命令下方整行，否则挤压命令区 */
+    .cmd {
+        flex-direction: column;
+    }
+
+    .cmd button {
+        padding: 0.6rem;
+        border-left: 0;
+        border-top: 1px solid var(--accent-dim);
+    }
+
+    dl.menu {
+        gap: 0.35rem 0.6rem;
+    }
+}
+
+</style>
 <script>
 document.documentElement.dataset.lang =
     localStorage.getItem('lang') || (navigator.language.indexOf('zh') === 0 ? 'zh' : 'en')
@@ -82,8 +528,8 @@ bash /root/tcpo</code></pre>
         <span data-l="en">When run from a local file the script does not touch the network — it copies itself to <code>/usr/local/bin/tcpo</code>. After that, <code>tcpo</code> works.</span>
     </p>
     <p class="hint">
-        <span data-l="zh">离线机上菜单 7（在线更新）会失败——这是预期的，不影响任何功能。要升级就重复上面的流程覆盖一次。</span>
-        <span data-l="en">On an offline box, menu 7 (online update) will fail — that's expected and affects nothing. To upgrade, just repeat the steps above and overwrite.</span>
+        <span data-l="zh">离线机上菜单 31（在线更新）会失败——预期行为。要升级就重复上面的流程覆盖一次。</span>
+        <span data-l="en">On an offline box, menu 31 fails as expected. Re-run the offline install to upgrade.</span>
     </p>
     <p class="hint">
         <span data-l="zh">想彻底禁止脚本联网：<code>TCP_DASHBOARD_NO_CHECK=1</code>。</span>
@@ -97,97 +543,109 @@ bash /root/tcpo</code></pre>
         <span data-l="en">Menu</span>
     </h2>
     <dl class="menu">
-        <dt class="key">9</dt>
+        <dt class="key">1</dt>
         <dd>
-            <span data-l="zh"><b>一键全部</b>：问几个问题后自动跑完所有优化</span>
-            <span data-l="en"><b>Do everything</b>: asks a few questions then runs all optimizations</span>
+            <span data-l="zh"><b>一键全部</b>：角色 + 带宽档位 + 基础调优 + 限速扫描/整形</span>
+            <span data-l="en"><b>Do everything</b>: role + bandwidth tier + base tune + policer sweep/shaping</span>
         </dd>
 
-        <dt class="key">1</dt>
+        <dt class="key">2</dt>
         <dd>
             <span data-l="zh">IPv4 优先解析</span>
             <span data-l="en">Prefer IPv4 resolution</span>
         </dd>
 
-        <dt class="key">i</dt>
+        <dt class="key">3</dt>
         <dd>
-            <span data-l="zh">关闭 IPv6（协议族整个关掉，比菜单 1 彻底；再按一次恢复）</span>
-            <span data-l="en">Disable IPv6 entirely (stronger than menu 1; press again to restore)</span>
+            <span data-l="zh">关闭 IPv6（协议族整个关掉，比菜单 2 彻底；再按一次恢复）</span>
+            <span data-l="en">Disable IPv6 entirely (stronger than menu 2; press again to restore)</span>
         </dd>
 
-        <dt class="key">2</dt>
+        <dt class="key">4</dt>
         <dd>
             <span data-l="zh">开启 BBR + FQ</span>
             <span data-l="en">Enable BBR + FQ</span>
         </dd>
 
-        <dt class="key">3</dt>
+        <dt class="key">5</dt>
         <dd>
-            <span data-l="zh">内核参数 · 保守档</span>
-            <span data-l="en">Kernel params · conservative</span>
+            <span data-l="zh">内核参数 · 普通档</span>
+            <span data-l="en">Kernel params · normal</span>
         </dd>
 
-        <dt class="key">4</dt>
+        <dt class="key">6</dt>
         <dd>
             <span data-l="zh">内核参数 · 中转档（中转/代理节点用）</span>
             <span data-l="en">Kernel params · transit (for relay/proxy nodes)</span>
         </dd>
 
-        <dt class="key">5</dt>
+        <dt class="key">7</dt>
         <dd>
             <span data-l="zh">网卡队列优化</span>
             <span data-l="en">NIC queue optimization</span>
         </dd>
 
-        <dt class="key">c</dt>
+        <dt class="key">8</dt>
         <dd>
             <span data-l="zh">立即应用 qdisc</span>
             <span data-l="en">Apply qdisc now</span>
         </dd>
 
-        <dt class="key ro">8</dt>
+        <dt class="key ro">20</dt>
         <dd>
             <span data-l="zh"><b>瓶颈诊断</b>（只看不改）</span>
             <span data-l="en"><b>Bottleneck diagnosis</b> (read-only)</span>
         </dd>
 
-        <dt class="key ro">a</dt>
+        <dt class="key ro">21</dt>
         <dd>
             <span data-l="zh"><b>调优效果测量</b>（只看不改）</span>
             <span data-l="en"><b>Effect measurement</b> (read-only)</span>
         </dd>
 
-        <dt class="key ro">b</dt>
+        <dt class="key ro">22</dt>
         <dd>
             <span data-l="zh"><b>MTU 探测</b>（只看不改）</span>
             <span data-l="en"><b>MTU probe</b> (read-only)</span>
         </dd>
 
-        <dt class="key">6</dt>
+        <dt class="key">23</dt>
+        <dd>
+            <span data-l="zh"><b>限速器拐点扫描</b>（真流量；可选用公共 iperf3 节点）</span>
+            <span data-l="en"><b>Policer knee sweep</b> (real traffic; optional public iperf3 peers)</span>
+        </dd>
+
+        <dt class="key">24</dt>
+        <dd>
+            <span data-l="zh">出向整形 开/关（HTB + fq pacing）</span>
+            <span data-l="en">Egress shaping on/off (HTB + fq pacing)</span>
+        </dd>
+
+        <dt class="key">30</dt>
         <dd>
             <span data-l="zh">回退全部优化</span>
             <span data-l="en">Roll back everything</span>
         </dd>
 
-        <dt class="key">7</dt>
+        <dt class="key">31</dt>
         <dd>
             <span data-l="zh">在线更新脚本</span>
             <span data-l="en">Update script online</span>
         </dd>
 
-        <dt class="key">q</dt>
+        <dt class="key">32</dt>
         <dd>
             <span data-l="zh">卸载面板</span>
             <span data-l="en">Uninstall</span>
         </dd>
     </dl>
     <p class="hint">
-        <span data-l="zh">标灰的 8/a/b 是只读功能，不装包、不改配置、不重启服务，生产机可以放心跑。唯一例外：菜单 a 里如果指定了压测对端且没装 <code>iperf3</code>，会问一次要不要装（压测会产生真实流量），答 N 就只做被动观测。</span>
-        <span data-l="en">Greyed 8/a/b are read-only — no packages installed, no config touched, no services restarted. Safe on production. One exception: in menu a, if you name a peer to benchmark against and <code>iperf3</code> is absent, it asks once (benchmarking generates real traffic); answer N and it stays passive-observation only.</span>
+        <span data-l="zh">标灰的 20/21/22 是只读功能，不装包、不改配置。菜单 23 会跑真实上行流量并可能装 <code>iperf3</code>（先问你）；菜单 21 的主动压测同样先问。</span>
+        <span data-l="en">Greyed 20/21/22 are read-only. Menu 23 generates real uplink traffic and may install <code>iperf3</code> (asks first); menu 21 active benchmarks also ask first.</span>
     </p>
     <p class="hint">
-        <span data-l="zh">菜单 <code>i</code> 关的是整个 IPv6 协议族，不只是解析顺序。这台机器只有 IPv6 入口时关掉就等于自断 SSH，所以执行前会检查当前 SSH 会话是否走 IPv6、有没有 IPv4 默认路由、出口网卡上有没有 IPv4 地址；信息不全（缺 <code>ip</code>、tmux 丢掉了 <code>SSH_CONNECTION</code>）同样直接拒绝，不给确认选项。它也不在菜单 9 的一键优化里。</span>
-        <span data-l="en">Menu <code>i</code> disables the whole IPv6 stack, not just resolution order. On a box reachable only over IPv6 that would cut your own SSH, so it first checks whether the current SSH session came in over IPv6, whether an IPv4 default route exists, and whether the egress NIC has an IPv4 address. Incomplete info (no <code>ip</code> command, <code>SSH_CONNECTION</code> lost in tmux) is also a hard refusal — no confirm prompt. It is also excluded from the menu-9 do-everything run.</span>
+        <span data-l="zh">菜单 <code>3</code> 关的是整个 IPv6 协议族。仅 IPv6 入口时关掉等于自断 SSH，执行前三道硬检查任一命中直接拒绝。不在菜单 1 一键优化里。</span>
+        <span data-l="en">Menu <code>3</code> disables the whole IPv6 stack. Hard refusals protect IPv6-only SSH. Excluded from menu-1 one-shot.</span>
     </p>
     <h3>
         <span data-l="zh">想先看看会改什么</span>
@@ -212,8 +670,8 @@ bash /root/tcpo</code></pre>
         <span data-l="en">Reversible</span>
     </h2>
     <p>
-        <span data-l="zh">每次改动前自动备份原始值，菜单 6 一键还原到改之前的状态。最坏情况是「参数没生效」，不会让机器开不了机。</span>
-        <span data-l="en">Original values are backed up automatically before every change. Menu 6 restores everything. The worst case is "the setting didn't take effect" — it will never break boot.</span>
+        <span data-l="zh">每次改动前自动备份原始值，菜单 30 一键还原（含 HTB 整形）。最坏情况是「参数没生效」，不会让机器开不了机。</span>
+        <span data-l="en">Original values are backed up before every change. Menu 30 restores everything including HTB shaping. Worst case: setting did not take effect — never breaks boot.</span>
     </p>
 </section>
 
@@ -223,8 +681,8 @@ bash /root/tcpo</code></pre>
         <span data-l="en">Compatibility</span>
     </h2>
     <p>
-        <span data-l="zh">支持 Debian / Ubuntu / RHEL / openSUSE / Arch / Alpine 六大系。写入类菜单（1-5、9、i）缺工具时自动安装，装不上会降级并说明影响；只读菜单（8/a/b）不主动装任何包，只提示手动补装命令（唯一例外是菜单 a 的 <code>iperf3</code>，会先问你一次）。<code>sysctl</code> 是唯一装不上就不做任何改动的依赖 —— 读不到原值就没有可靠回退。</span>
-        <span data-l="en">Supports Debian, Ubuntu, RHEL, openSUSE, Arch, and Alpine. The writing menus (1-5, 9, i) install missing tools automatically and degrade if that fails; the read-only menus (8/a/b) install nothing on their own and just print a manual install command (the sole exception is <code>iperf3</code> in menu a, which asks you first). <code>sysctl</code> is the one dependency whose absence aborts the change outright — without it there is no reliable rollback.</span>
+        <span data-l="zh">支持 Debian / Ubuntu / RHEL / openSUSE / Arch / Alpine。写入类菜单（1-8、23、24）缺工具时自动装；只读 20/21/22 不装包。23/21 的 <code>iperf3</code> 会先问。<code>sysctl</code> 装不上则不做改动。</span>
+        <span data-l="en">Supports Debian, Ubuntu, RHEL, openSUSE, Arch, and Alpine. Writing menus (1-8, 23, 24) may auto-install tools; read-only 20/21/22 do not. Menus 23/21 ask before installing <code>iperf3</code>. Missing <code>sysctl</code> aborts writes — no reliable rollback without it.</span>
     </p>
 </section>
 

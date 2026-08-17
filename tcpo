@@ -11,7 +11,7 @@
 # [人工决策-2026-08-05 14:22:07] 只用单个整数递增，不用 semver 的三段式。
 # 判据是「不等即提示」本来就不需要大小关系，三段式反而要求维护者每次判断
 # 这算 minor 还是 patch。改动此处必须同步 VERSION 文件（Jenkins 门 4 会逐字校验）
-SCRIPT_VERSION="3"
+SCRIPT_VERSION="4"
 
 # --- 分发地址：改这一处即可（自建域名 / GitHub raw / jsDelivr）---
 # 支持环境变量覆盖，便于本地测试：TCP_DASHBOARD_URL=http://127.0.0.1:8000/tcpo bash tcpo
@@ -40,10 +40,10 @@ BBR_OPT="/etc/sysctl.d/10-bbr.conf"
 BBR_MODLOAD="/etc/modules-load.d/bbr.conf"
 LIMITS_OPT="/etc/security/limits.d/99-network-performance.conf"
 # 关闭 IPv6 单独一份 drop-in：它与「网络调优」不是一回事（是关掉一整个协议族），
-# 独立文件才能单独回退，也不会让菜单 3/4 重写主配置时把它带上
+# 独立文件才能单独回退，也不会让菜单 5/6 重写主配置时把它带上
 IPV6_OPT="/etc/sysctl.d/zz-disable-ipv6.conf"
 # gai.conf 与备份，集中成常量以纳入演练模式路径重定向（曾散落七处硬编码，
-# 导致 TCPO_DRYRUN=1 跑菜单 1 仍真实改机）
+# 导致 TCPO_DRYRUN=1 跑菜单 2 仍真实改机）
 GAI_CONF="/etc/gai.conf"
 GAI_BAK="/etc/gai.conf.bak"
 # 状态标记与诊断要读真机状态，不跟演练重定向走，否则演练模式会让用户误以为真机已改；
@@ -63,6 +63,13 @@ VERSION_CACHE="$STATE_DIR/version-check"
 NICPLAN="$STATE_DIR/nic.plan"
 # qdisc 重放单独一份 plan：格式（要跑 tc 命令、区分 mq）与 $NICPLAN 不同，混一起会互相干扰
 QDISCPLAN="$STATE_DIR/qdisc.plan"
+# 出向 HTB 整形（限速器拐点扫描结果）：独立脚本 + unit，可单独 shape --off 而不动基础调优
+SHAPE_SCRIPT="/usr/local/bin/tcp_dashboard_shape.sh"
+SHAPE_UNIT="/etc/systemd/system/tcp-dashboard-shape.service"
+SHAPE_RATE="$STATE_DIR/shape.rate"
+SWEEP_RESULT="$STATE_DIR/sweep.result"
+# 扫描用锁：两个会话同时换 qdisc / 写快照会踩坏现场
+TCPO_LOCK="$STATE_DIR/tcpo.lock"
 NIC_UNIT="/etc/systemd/system/tcp-dashboard-nic.service"
 NIC_APPLY="/usr/local/bin/tcp-dashboard-nic-apply.sh"
 # networkd-dispatcher 钩子：网卡变 routable 时重放队列设置，只有装了 systemd-networkd 才有此目录
@@ -71,7 +78,7 @@ NIC_DISPATCH="/etc/networkd-dispatcher/routable.d/50-tcp-dashboard"
 MSS_TAG="tcpo-mss-clamp"
 # RTT/抖动探测目标，集中一处避免探测函数与文案分叉
 RTT_PROBE_TARGETS="1.1.1.1 8.8.8.8 9.9.9.9"
-# RFS 全局流表单独一份 drop-in，使菜单 5 可独立于主配置文件执行
+# RFS 全局流表单独一份 drop-in，使菜单 7 可独立于主配置文件执行
 NIC_SYSCTL_OPT="/etc/sysctl.d/zz-network-rfs.conf"
 # 无 systemd 环境开机不读 sysctl.d，生成重放脚本挂到自家 init；不自动改 wsl.conf/rc 目录
 SYSCTL_APPLY="/usr/local/bin/tcp-dashboard-sysctl-apply.sh"
@@ -122,6 +129,11 @@ if [ "${TCPO_DRYRUN:-0}" = "1" ]; then
     VERSION_CACHE="$STATE_DIR/version-check"
     NICPLAN="$STATE_DIR/nic.plan"
     QDISCPLAN="$STATE_DIR/qdisc.plan"
+    SHAPE_SCRIPT="$DRYRUN_ROOT$SHAPE_SCRIPT"
+    SHAPE_UNIT="$DRYRUN_ROOT$SHAPE_UNIT"
+    SHAPE_RATE="$STATE_DIR/shape.rate"
+    SWEEP_RESULT="$STATE_DIR/sweep.result"
+    TCPO_LOCK="$STATE_DIR/tcpo.lock"
     SYSCTL_APPLY_STAMP="$STATE_DIR/sysctl-apply.stamp"
 fi
 
@@ -173,7 +185,7 @@ draw_line() {
     echo -e "${YELLOW}--------------------------------------------------${NC}"
 }
 
-# 校验下载文件是否真是本脚本，首次安装与菜单 7 更新共用同一份、严格程度一致。
+# 校验下载文件是否真是本脚本，首次安装与菜单 31 更新共用同一份、严格程度一致。
 # 三条判据任一不过即放弃：首行是 shebang（防 HTML 错误页）、过 bash -n（防截断）、
 # 含本脚本特征串（防拿到别的 shell 脚本）
 validate_script() {
@@ -198,6 +210,33 @@ BATCH=0
 pause_return() {
     [ "$BATCH" = "1" ] && return
     read -p "按回车返回..."
+}
+
+# 排空 stdin 里已排队的键（不阻塞、有上限）。
+# 自动选点会卡几秒，期间敲的回车躺在缓冲里；下一句 read 会瞬间吃掉当取消。
+# [人工决策] -t 0 在部分 WSL/bash 上会「一直成功但不消费」→ while 死循环，
+# 表现就是卡在「带宽按…对端…」后面、确认提示永远不出来。必须：短超时 + 次数上限。
+drain_stdin() {
+    local _z n=0
+    while [ "$n" -lt 64 ]; do
+        # 0.05s：没键立刻失败退出循环；有键读 1 字节再继续
+        IFS= read -r -t 0.05 -n 1 _z 2>/dev/null || break
+        n=$((n + 1))
+    done
+    return 0
+}
+
+# 交互确认统一从 /dev/tty 读，避免 stdin 被管道/残留搞乱。
+# 无 tty 时退回 stdin（非交互/CI）。
+read_tty() {
+    # usage: read_tty "提示" varname
+    local _prompt=$1 _var=$2 _val
+    if [ -r /dev/tty ]; then
+        read -r -p "$_prompt" _val </dev/tty || _val=""
+    else
+        read -r -p "$_prompt" _val || _val=""
+    fi
+    printf -v "$_var" '%s' "$_val"
 }
 
 # ==================================================
@@ -266,7 +305,7 @@ pkg_for() {
     sysctl)
         # RHEL 系最小化镜像（实测 rockylinux:9）不自带 sysctl，procps-ng 提供它。
         # 判例：缺它时 `sysctl -n` 全部失败，本脚本把每个 key 都记成 ABSENT——
-        # 快照全空、生效校验全报读不到、菜单 i 的状态判定恒假（关不掉也恢复不了）。
+        # 快照全空、生效校验全报读不到、菜单 3 的状态判定恒假（关不掉也恢复不了）。
         # Alpine 的 sysctl 来自 busybox（已内置），仍给出 procps 映射作兜底
         case "$pm" in
         apt-get) echo procps ;;
@@ -427,7 +466,7 @@ ensure_tools() {
     return 0
 }
 
-# 只读功能（菜单 8/a/b）专用，绝不装包，只检测报告缺什么并给手动补装命令——
+# 只读功能（菜单 20/21/22）专用，绝不装包，只检测报告缺什么并给手动补装命令——
 # 这三个菜单对外承诺零副作用，而装包会刷新索引、改 dpkg/rpm 数据库，不算零副作用。
 # 返回 0 = 全部就绪，1 = 有缺失
 require_tools_readonly() {
@@ -456,7 +495,7 @@ require_tools_readonly() {
 }
 
 # RHEL 系最小化安装可能没有 /etc/sysctl.d（Debian 系自带易掩盖此问题），
-# 直接 cat > 会静默失败——曾实测 Rocky 9 容器里菜单 3 全程无配置写入
+# 直接 cat > 会静默失败——曾实测 Rocky 9 容器里菜单 5 全程无配置写入
 ensure_sysctl_dir() {
     [ -d /etc/sysctl.d ] && return 0
     mkdir -p /etc/sysctl.d 2>/dev/null && return 0
@@ -468,7 +507,7 @@ ensure_sysctl_dir() {
 # [人工决策-2026-08-16 16:50:51] 判例（alpine:3.21 实测）：busybox sysctl 遇到
 # --system 会打印 "unrecognized option" + 自己的帮助文本，参数一个都不应用，
 # 而 apply_sysctl 的报错过滤只捞到帮助文本里的字样、判不出失败，于是一路报「已生效」。
-# 后果不限于本次新增的 IPv6：菜单 2/3/4 在 Alpine 上写的参数从来就没被应用过。
+# 后果不限于本次新增的 IPv6：菜单 4/5/6 在 Alpine 上写的参数从来就没被应用过。
 # 过去没暴露是因为 distro-test 只断言配置文件内容、不查运行时值（容器里 net.core.* 本就读不到），
 # 本轮新增的 IPv6 运行时断言是第一条真查生效值的。
 # 判据用 `sysctl --help` 里有没有 system 字样：直接跑 --system 试探会真的改机器
@@ -515,7 +554,7 @@ apply_sysctl() {
     # [人工决策-2026-08-16 22:31:43] 缺 sysctl 命令时必须明确失败，不能继续。
     # 旧写法直接跑 `sysctl --system`，shell 报 "command not found" 但退出码/输出
     # 对不上后面的报错过滤（只 grep cannot|error|...），于是 apply 与回退都当成功，
-    # 运行时值一项都没动。菜单 6 也会一路打出「回退完成」
+    # 运行时值一项都没动。菜单 30 也会一路打出「回退完成」
     if ! command -v sysctl >/dev/null 2>&1; then
         ensure_tools sysctl >/dev/null
         if ! command -v sysctl >/dev/null 2>&1; then
@@ -587,8 +626,8 @@ EOF
 # 判据：本机开机时有没有人读 /etc/sysctl.d/；有 systemd 才有 systemd-sysctl
 # [人工决策-2026-08-05 14:22:07] 加这一层的起因是实测判例：WSL2 默认不跑 systemd，
 # 面板跑完参数确实生效，wsl --shutdown 后全部回到原值，而主菜单始终显示「已开启」、
-# 菜单 3 还打印「配置持久化于 xxx」——用户以为早就调好了，实际每次重启都白调。
-# 菜单 5 的网卡队列本来就查 has_systemd 并如实降级，sysctl 这条路径漏了同样的判断。
+# 菜单 5 还打印「配置持久化于 xxx」——用户以为早就调好了，实际每次重启都白调。
+# 菜单 7 的网卡队列本来就查 has_systemd 并如实降级，sysctl 这条路径漏了同样的判断。
 # 规则：凡宣布「持久化」前必须先探测本机开机会不会重放，禁止无条件打印
 
 # 容器判据，原内联在 verify_sysctl_applied 里，现两处都要用故提出来
@@ -784,7 +823,7 @@ modules_load_has_bbr() {
     # name in /run/, /usr/local/lib/, and /lib/」，而 strings 二进制确认搜索路径是五个：
     # /etc、/run、/usr/local/lib、/usr/lib、/lib。
     # 漏掉 /usr/local/lib 的后果是：tcp_bbr 由那里提供时会被误判成「开机没人加载」，
-    # 于是菜单 2/3/4 报错误告警、还多生成一份不需要的重放脚本与挂载提示。
+    # 于是菜单 4/5/6 报错误告警、还多生成一份不需要的重放脚本与挂载提示。
     # /lib 通常是 /usr/lib 的符号链接，但不能假定（有发行版不做 usr-merge），一并查
     for f in /etc/modules-load.d/*.conf /usr/local/lib/modules-load.d/*.conf \
         /usr/lib/modules-load.d/*.conf /lib/modules-load.d/*.conf; do
@@ -812,7 +851,7 @@ write_sysctl_apply() {
 # systemd 机器不需要它——systemd-sysctl 会自动应用 /etc/sysctl.d/*.conf。
 # 先 modprobe 再应用参数：BBR 是模块时，/etc/modules-load.d 在无 systemd 环境
 # 同样没人读，不先加载模块的话 tcp_congestion_control=bbr 会被内核直接拒绝。
-# 条件是「本脚本管的任一配置文件里写了 bbr」而不是「$BBR_OPT 存在」——菜单 3/4
+# 条件是「本脚本管的任一配置文件里写了 bbr」而不是「$BBR_OPT 存在」——菜单 5/6
 # 把 bbr 写进主配置文件，那时 $BBR_OPT 并不存在，只看它会漏掉这条最常见的路径
 for _c in $BBR_OPT $SYSCTL_OPT; do
     [ -f "\$_c" ] && grep -qE '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=[[:space:]]*bbr' "\$_c" 2>/dev/null && {
@@ -852,7 +891,7 @@ else
         sysctl -p /etc/sysctl.conf 2>&1
     } >>$APPLY_LOG 2>&1
 fi
-# 菜单 5 的 /sys 队列设置（RPS/RFS/XPS）也一并重放，省得再挂第二个钩子
+# 菜单 7 的 /sys 队列设置（RPS/RFS/XPS）也一并重放，省得再挂第二个钩子
 [ -x $NIC_APPLY ] && $NIC_APPLY
 # 记录「本次开机 + 该 boot 内最早一次运行的 uptime」。面板据此判断本脚本是否被挂进
 # 启动链：uptime 很小 => 是 init 在开机早期自动拉起的；很大 => 是谁手工跑的。
@@ -937,7 +976,7 @@ APPLYEOF
     return 0
 }
 
-# 「重放脚本挂到哪」的说明。菜单 2/3/4 与菜单 5 都要打印，提出来共用一份，
+# 「重放脚本挂到哪」的说明。菜单 4/5/6 与菜单 7 都要打印，提出来共用一份，
 # 免得两处文案漂移（一处教对了、另一处还在教旧办法）
 # 「看起来已挂好」时给出「怎么自己核实一遍」的具体命令。
 # 不替用户下结论，只告诉他去看哪里——那段配置还在不在，只有看配置本身才知道
@@ -974,9 +1013,9 @@ wsl_boot_hint() {
 
 # [人工决策-2026-08-05 15:47:12] 判例：sysvinit 机器上 procps 会重放 /etc/sysctl.d，
 # 早期版本据此报「已持久化」，但 BBR 实际没恢复。所以模块与参数必须分别核实、分别报
-# [人工决策-2026-08-05 22:41:09] 菜单 3/4 从「只给人工命令」改为「自动补齐」：
+# [人工决策-2026-08-05 22:41:09] 菜单 5/6 从「只给人工命令」改为「自动补齐」：
 # 它们已经在写 tcp_congestion_control=bbr 了，不配齐模块加载等于写了一个重启就失效的
-# 参数——那本身就不自洽。$BBR_MODLOAD 已在菜单 6 的清理清单里，可完整回退。
+# 参数——那本身就不自洽。$BBR_MODLOAD 已在菜单 30 的清理清单里，可完整回退。
 # 三个判例都记在这里，别再退回裸重定向：
 #   1) 只在「available 里没有 bbr」时写 —— 模块已被手工 modprobe 的机器走不到，
 #      于是永远没有持久化配置，重启回 cubic
@@ -1037,7 +1076,7 @@ bbr_persist_note() {
     return 1
 }
 
-# 菜单 2/3/4 写完配置后统一调这里报持久化状态
+# 菜单 4/5/6 写完配置后统一调这里报持久化状态
 report_sysctl_persist() {
     local conf=$1
     if has_systemd; then
@@ -1147,7 +1186,7 @@ net.ipv6.conf.lo.disable_ipv6
 "
 
 # 关闭 IPv6 要写的三个 key，与 MANAGED_KEYS 里的 ipv6 三项必须是同一组。
-# 单列一份是因为菜单 i 只写这三项、回退只需还原这三项，而 MANAGED_KEYS 是全量清单
+# 单列一份是因为菜单 3 只写这三项、回退只需还原这三项，而 MANAGED_KEYS 是全量清单
 IPV6_KEYS="
 net.ipv6.conf.all.disable_ipv6
 net.ipv6.conf.default.disable_ipv6
@@ -1199,13 +1238,155 @@ atomic_append() {
     } | atomic_write "$target"
 }
 
+# 把网卡从 HTB/单根 qdisc 拆回「内核默认结构 + default_qdisc」。
+# 多队列必须保留 mq root、只改叶子——与 apply_live_qdisc / 回退 QDISCPLAN 同一口径。
+# 直接 replace root fq 会把 mq 压成单队列，属于行为回归（审查 #2）。
+restore_default_qdisc() {
+    # 拆 HTB/单根后回到「内核默认结构 + default_qdisc」。
+    # 任一步 tc 失败都累计，最终 return 1——调用方不得把失败当成功（审查：吞错假恢复）。
+    local iface=$1 want root leaf p cur fail=0 leaf_n=0 leaf_ok=0
+    [ -n "$iface" ] || return 1
+    command -v tc >/dev/null 2>&1 || return 1
+    want=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    [ -n "$want" ] || want=fq
+
+    cur=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1{print $2}')
+    case "$cur" in
+    htb)
+        # 拆 HTB 后，多队列网卡内核会自动重建 mq root
+        if ! tc qdisc del dev "$iface" root 2>/dev/null; then
+            fail=1
+        fi
+        ;;
+    mq | mqprio) ;;
+    noqueue) return 0 ;;
+    '')
+        ;;
+    *)
+        # 单根 fq 等：del 让内核按硬件队列数重建（多队列会回到 mq）
+        if ! tc qdisc del dev "$iface" root 2>/dev/null; then
+            # 已无 root 时 del 也可能非 0，再读一次确认
+            cur=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1{print $2}')
+            case "$cur" in
+            htb | '') fail=1 ;;
+            esac
+        fi
+        ;;
+    esac
+
+    IFS=$'\t' read -r root leaf <<<"$(qdisc_kinds "$iface")"
+    case "$root" in
+    mq | mqprio)
+        for p in $(tc qdisc show dev "$iface" 2>/dev/null |
+            awk '/parent/{for(i=1;i<=NF;i++) if($i=="parent") print $(i+1)}'); do
+            leaf_n=$((leaf_n + 1))
+            if tc qdisc replace dev "$iface" parent "$p" "$want" 2>/dev/null; then
+                leaf_ok=$((leaf_ok + 1))
+            fi
+        done
+        # 想换成 want 时：有叶子却一个都没换上 = 失败。
+        # 部分成功（leaf_ok 在 1..n-1）也失败。但 want 在本网卡上根本装不上
+        # （WSL/Hyper-V 虚拟口常见：sysctl 是 fq，运行时只能 pfifo_fast）时，
+        # 叶子全失败且 root 已非 htb → 视为「尽力恢复」成功，不挡扫描。
+        if [ "$leaf_n" -gt 0 ] && [ "$leaf_ok" -ne "$leaf_n" ]; then
+            if [ "$leaf_ok" -eq 0 ]; then
+                # 全失败：只要没停在 htb，接受现状（虚拟网卡限制）
+                :
+            else
+                fail=1
+            fi
+        fi
+        ;;
+    noqueue) ;;
+    '')
+        # del 之后仍读不到 root：多半权限/设备问题
+        fail=1
+        ;;
+    *)
+        if [ "$root" != "$want" ]; then
+            if ! tc qdisc replace dev "$iface" root "$want" 2>/dev/null; then
+                # 换不到 want：当前已是非 htb 则接受（WSL 上 pfifo_fast 很常见）
+                case "$root" in
+                htb) fail=1 ;;
+                esac
+            fi
+        fi
+        ;;
+    esac
+    # 终态核对：仍是 htb 必失败；非 htb 即「可作基线/可当拆整形结果」
+    cur=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1{print $2}')
+    [ "$cur" = "htb" ] && fail=1
+    return "$fail"
+}
+
+
+# 会话互斥：shape/sweep/rollback 都会改 root qdisc 与共享状态文件。
+# flock 不可用时降级为警告继续（busybox 最小环境可能没有），不硬挡。
+take_tcpo_lock() {
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    command -v flock >/dev/null 2>&1 || {
+        echo -e "  ${YELLOW}本机无 flock，无法串行化并发会话；请勿同时开两个 tcpo 改 qdisc${NC}" >&2
+        return 0
+    }
+    # 不能写成 exec 9>FILE 2>/dev/null —— 那个 2>/dev/null 会被 exec 永久重定向 stderr
+    [ -w "$STATE_DIR" ] || return 0
+    exec 9>"$TCPO_LOCK" || return 0
+    if flock -n 9; then
+        return 0
+    fi
+    echo -e "  ${RED}另一个 tcpo 会话正在改网络参数（锁 $TCPO_LOCK）${NC}" >&2
+    echo -e "  ${YELLOW}等它结束，或确认无残留进程后: rm -f $TCPO_LOCK${NC}" >&2
+    return 1
+}
+
+# 端口连通探测：始终带墙钟上限。缺 timeout 命令时用后台 /dev/tcp + kill 自实现。
+# 裸 /dev/tcp 在被过滤地址上会无限阻塞，违反「自动联网必须带超时」。
+tcp_connect_ok() {
+    # 端口连通探测：始终带墙钟上限；host/port 只许主机名/IP 与数字端口，禁止进 bash -c 插值。
+    local host=$1 port=$2
+    # 主机：字母数字 . _ : -（IPv6 用 :）；拒绝 $ ` ; | & 空格等元字符
+    case "$host" in
+    '' | *[!A-Za-z0-9._:\[\]-]*) return 1 ;;
+    esac
+    case "$port" in
+    '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 1
+
+    if command -v timeout >/dev/null 2>&1; then
+        # 用位置参数传入，不用字符串拼接——内层 bash 看不到可注入文本
+        timeout 2 bash -c 'echo >"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
+        return $?
+    fi
+    # 无 timeout：后台连 + 轮询，最多约 2 秒。/dev/tcp 展开在本 shell，已校验过格式
+    (echo >/dev/tcp/"$host"/"$port") >/dev/null 2>&1 &
+    local pid=$! i=0
+    while [ "$i" -lt 20 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null
+            return $?
+        fi
+        sleep 0.1 2>/dev/null || {
+            sleep 1
+            i=$((i + 10))
+            continue
+        }
+        i=$((i + 1))
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 1
+}
+
+
+
 # 本版本新增到 MANAGED_KEYS 的 key，供老快照补齐（见 append_missing_originals）。
 # 加新参数时把它列进来，下一个版本再清空——留着不会出错（老快照补过就不再补），
 # 但清空能让「哪些是本版本新增」这件事保持准确
 NEW_MANAGED_KEYS="$IPV6_KEYS"
 
 # 给「本版本新增到 MANAGED_KEYS 的 key」补一次快照。
-# [人工决策-2026-08-16 16:50:51] 起因是加菜单 i（关闭 IPv6）时发现的缺陷：
+# [人工决策-2026-08-16 16:50:51] 起因是加菜单 3（关闭 IPv6）时发现的缺陷：
 # save_original_values 在快照文件已存在时整个跳过，于是老用户升级后新增 key 永远没有原值，
 # restore_managed_keys 把「读不到」记为跳过——参数改得进去、回退还不回来，
 # 而回退能力是本项目的最高优先级。
@@ -1489,7 +1670,7 @@ if [ "$SELF" != "$SCRIPT_PATH" ]; then
             exit 1
         fi
     else
-        # 管道执行：先落临时文件、校验再就位（与菜单 7 共用 validate_script）
+        # 管道执行：先落临时文件、校验再就位（与菜单 31 共用 validate_script）
         if ! curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH.tmp"; then
             rm -f "$SCRIPT_PATH.tmp"
             echo -e "${RED}下载失败，请检查网络或 SCRIPT_URL: $SCRIPT_URL${NC}"
@@ -1580,11 +1761,37 @@ fetch_latest_version() {
     return 0
 }
 
-# 有新版时给菜单标题用的一行提示。同版本或检查失败都返回空串
+# 有新版时给菜单标题用的一行提示。同版本、远端更旧、检查失败都返回空串。
+# 只比「不等」会把「远端 2、本地 4」误报成有新版（线上 VERSION 未跟上时实测踩过）。
+version_is_newer() {
+    # version_is_newer <远端> <本地> → 0 表示远端更新
+    local a=$1 b=$2
+    case "$a" in '' | *[!0-9.]* | .* | *..) return 1 ;; esac
+    case "$b" in '' | *[!0-9.]* | .* | *..) return 1 ;; esac
+    # 按 . 分段数值比较，缺段当 0（4 与 4.0 同等；4.1 > 4）
+    local IFS=.
+    local -a aa bb
+    # shellcheck disable=SC2206
+    aa=($a) bb=($b)
+    local i na=${#aa[@]} nb=${#bb[@]} n max
+    max=$na
+    [ "$nb" -gt "$max" ] && max=$nb
+    for ((i = 0; i < max; i++)); do
+        na=${aa[i]:-0}
+        nb=${bb[i]:-0}
+        case "$na" in '' | *[!0-9]*) na=0 ;; esac
+        case "$nb" in '' | *[!0-9]*) nb=0 ;; esac
+        if [ "$na" -gt "$nb" ] 2>/dev/null; then return 0; fi
+        if [ "$na" -lt "$nb" ] 2>/dev/null; then return 1; fi
+    done
+    return 1
+}
+
 version_hint() {
     [ -n "$LATEST_VERSION" ] || return 0
     [ "$LATEST_VERSION" = "$SCRIPT_VERSION" ] && return 0
-    printf '%s' "${YELLOW}有新版 ${LATEST_VERSION}（当前 ${SCRIPT_VERSION}，菜单 7 更新）${NC}"
+    version_is_newer "$LATEST_VERSION" "$SCRIPT_VERSION" || return 0
+    printf '%s' "${YELLOW}有新版 ${LATEST_VERSION}（当前 ${SCRIPT_VERSION}，菜单 31 更新）${NC}"
 }
 
 check_update() {
@@ -1628,11 +1835,11 @@ uninstall_script() {
         # 判例：rollback_tune 在缺 sysctl 时会清理配置文件但写不回运行时值并 return 1；
         # 旧写法不查返回值，接着 rm -rf $STATE_DIR（快照没了）+ rm 脚本本身——
         # 用户既丢了重试入口，又丢了唯一的原值依据，一次「未完整回退」升级成不可自救。
-        # 可回退性是最高优先级：失败就停，把现场留给用户修好后重跑菜单 6 / 卸载
+        # 可回退性是最高优先级：失败就停，把现场留给用户修好后重跑菜单 30 / 卸载
         if ! rollback_tune; then
             echo -e "\n  ${RED}回退未完整，已中止卸载${NC}"
             echo -e "  ${YELLOW}脚本与状态目录（含快照 $ORIG_STATE）均保留，便于修好后重试${NC}"
-            echo -e "  ${YELLOW}请确认 sysctl 可用（procps-ng / procps）后：先跑菜单 6，确认回退完成再卸载${NC}"
+            echo -e "  ${YELLOW}请确认 sysctl 可用（procps-ng / procps）后：先跑菜单 30，确认回退完成再卸载${NC}"
             pause_return
             return 1
         fi
@@ -1661,7 +1868,7 @@ set_ipv4_priority() {
     # 演练模式下要先把真实文件拷进临时目录作为起点，否则会走「生成默认模板」分支，
     # 结果与真实改动不符。
     # [人工决策-2026-08-05 15:31:20] 演练必须反映真实起点：读真实文件、写临时副本。
-    # 早前版本这个函数完全绕过 DRYRUN 重定向，TCPO_DRYRUN=1 跑菜单 1 会真实改机，
+    # 早前版本这个函数完全绕过 DRYRUN 重定向，TCPO_DRYRUN=1 跑菜单 2 会真实改机，
     # 与「零写入」承诺直接冲突
     if [ "$DRYRUN" = "1" ] && [ ! -f "$GAI_CONF" ] && [ -f /etc/gai.conf ]; then
         cp /etc/gai.conf "$GAI_CONF" 2>/dev/null &&
@@ -1740,7 +1947,7 @@ EOF
 # ==================================================
 # [人工决策-2026-08-16 16:50:51] 加这一项的判据与其他菜单不同，单独记在这里。
 # 起因：某些上游（实测 grok.com）对 VPS 的 IPv6 出口直接拦，而 Node/Go 这类自带
-# 解析器的程序绕过 gai.conf，菜单 1 的 IPv4 优先对它们无效——只能关掉协议族本身。
+# 解析器的程序绕过 gai.conf，菜单 2 的 IPv4 优先对它们无效——只能关掉协议族本身。
 #
 # 这是本项目唯一一个「最坏情况可能不止于参数没生效」的写入项：机器只有 IPv6 入口时
 # 关掉它就等于自断 SSH，而本面板经 SSH 使用，失联即无法自救。所以按用户要求全关
@@ -1750,8 +1957,8 @@ EOF
 #   2) 有 IPv6 默认路由但没有 IPv4 默认路由（唯一出口是 v6）
 #   3) 出口网卡上只有 IPv6 全局地址、没有 IPv4 地址
 # 监听 :: 的服务只警告不拒绝：那是「服务可能起不来」，属可回退范畴，由用户判断。
-# 归属文件独立（$IPV6_OPT）而非并进主配置：菜单 3/4 会整份重写主配置，混在一起
-# 会让「关了 IPv6」被一次普通调优悄悄带走或带回。不进菜单 9——一键优化里关掉
+# 归属文件独立（$IPV6_OPT）而非并进主配置：菜单 5/6 会整份重写主配置，混在一起
+# 会让「关了 IPv6」被一次普通调优悄悄带走或带回。不进菜单 1——一键优化里关掉
 # 一整个协议族对别人是意外的语义变更
 #
 # 关 lo 的 ::1 是用户明确要求的（[人工决策-2026-08-16 16:50:51]），但它会让
@@ -1905,7 +2112,7 @@ ipv6_disabled_now() {
 disable_ipv6() {
     echo -e "\n${YELLOW}>>> 关闭 IPv6${NC}"
     echo -e "  ${CYAN}用途：上游按 IPv6 出口做拦截时（实测 grok.com 一类），关掉协议族让流量只走 IPv4。${NC}"
-    echo -e "  ${CYAN}与菜单 1 的区别：菜单 1 只改解析优先级，自带解析器的程序（Node/Go）不认它。${NC}"
+    echo -e "  ${CYAN}与菜单 2 的区别：菜单 2 只改解析优先级，自带解析器的程序（Node/Go）不认它。${NC}"
 
     # sysctl 命令本身可能缺（RHEL 系最小化镜像实测如此），它是快照、应用、校验的共同前提。
     # 缺了不能硬跑：那样三个 key 全被记成 ABSENT，写出去的文件不生效、回退也没有原值可写回，
@@ -2015,7 +2222,7 @@ disable_ipv6() {
     for k in $IPV6_KEYS; do
         echo -e "    ${CYAN}$k = 1${NC}"
     done
-    echo -e "  ${CYAN}回退：再进菜单 i（关闭后该键变成「恢复 IPv6」），或菜单 6 连同全部优化一起回退${NC}"
+    echo -e "  ${CYAN}回退：再进菜单 3（关闭后该键变成「恢复 IPv6」），或菜单 30 连同全部优化一起回退${NC}"
     read -p "  确认关闭 IPv6？[y/N]: " _c
     [[ "$_c" =~ ^[Yy]$ ]] || {
         echo -e "${GREEN}已取消。${NC}"
@@ -2027,7 +2234,7 @@ disable_ipv6() {
     save_original_values || { pause_return; return 1; }
     ensure_sysctl_dir || { pause_return; return 1; }
 
-    # 与菜单 3 同口径：写入前先说清哪些 key 在本环境设不了（容器命名空间外常见），
+    # 与菜单 5 同口径：写入前先说清哪些 key 在本环境设不了（容器命名空间外常见），
     # 只报告不阻断——配置文件仍要落地，宿主放开权限后重启即生效
     sysctl_precheck "$IPV6_KEYS"
 
@@ -2045,7 +2252,7 @@ disable_ipv6() {
 #
 # 三项都写：all 管已存在的接口，default 管之后新建的接口（含容器 veth），
 # lo 连本机 ::1 一起关。绑 ::1 的本地服务会连不上，这是关 lo 的已知代价。
-# 回退: 运行 tcpo 选菜单 i（此时该键显示「恢复 IPv6」），或菜单 6 连同全部优化一起回退。
+# 回退: 运行 tcpo 选菜单 3（此时该键显示「恢复 IPv6」），或菜单 30 连同全部优化一起回退。
 # 两者都会删除本文件并把三个 key 写回首次运行前的原始值
 # ==================================================
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -2095,8 +2302,8 @@ EOF
     pause_return
 }
 
-# 单独还原 IPv6（菜单 i 在已开启时提供的关闭入口）。
-# 与菜单 6 的差别只在范围：只删本项的文件、只写回本项那三个 key，不碰其他优化
+# 单独还原 IPv6（菜单 3 在已开启时提供的关闭入口）。
+# 与菜单 30 的差别只在范围：只删本项的文件、只写回本项那三个 key，不碰其他优化
 restore_ipv6() {
     echo -e "\n${YELLOW}>>> 重新启用 IPv6${NC}"
     # 与 disable_ipv6 同一前提：没有 sysctl 就写不回运行时值，只删文件不算恢复
@@ -2117,14 +2324,14 @@ restore_ipv6() {
     rm -f "$IPV6_OPT"
     # [人工决策-2026-08-16 22:31:43] 关闭时 takeover_conflicts 会把用户原文件里的
     # disable_ipv6 行注释掉。只删 $IPV6_OPT 不解开那些注释 = 用户原配置永久失效，
-    # 「按一次 i 再按一次 i」回不到菜单 i 执行前的真实状态。
-    # 只解开归属本项（owner=$IPV6_OPT）的标记，不动菜单 3/4 接管的其他参数
+    # 「按一次 3 再按一次 3」回不到菜单 3 执行前的真实状态。
+    # 只解开归属本项（owner=$IPV6_OPT）的标记，不动菜单 5/6 接管的其他参数
     # [人工决策-2026-08-16 22:49:27] 接管解开 / apply / 写回 任一失败都不能报「已恢复」。
     # 旧写法只看 ipv6_disabled_now：运行时被写成 0 就报成功，即使用户原配置行仍是
     # 注释——重启后 sysctl.d 里没有生效的 disable_ipv6=0，语义仍是坏的
     local ok=1
     restore_ipv6_takeovers || ok=0
-    # 顺序与菜单 6 一致：先 --system 让还留着的/刚解开的文件重新生效，再逐个写回快照值。
+    # 顺序与菜单 30 一致：先 --system 让还留着的/刚解开的文件重新生效，再逐个写回快照值。
     # 反过来做的话 --system 会覆盖刚写回的值
     apply_sysctl || {
         echo -e "  ${RED}应用 sysctl 失败，运行时值可能未还原${NC}"
@@ -2153,15 +2360,15 @@ restore_ipv6() {
             echo -e "  ${RED}仍有文件残留 IPv6 接管标记（用户原配置未解开）${NC}"
             echo -e "  ${YELLOW}手动: grep -rn 'moved to.*zz-disable-ipv6' /etc/sysctl.d/ /etc/sysctl.conf${NC}"
         fi
-        echo -e "  ${YELLOW}修好后重跑菜单 i（恢复）${NC}"
+        echo -e "  ${YELLOW}修好后重跑菜单 3（恢复）${NC}"
     fi
     pause_return
     [ "$ok" = "1" ] && ! ipv6_disabled_now
 }
 
-# 解开菜单 i 关闭时留下的接管标记。
+# 解开菜单 3 关闭时留下的接管标记。
 # 标记格式由 comment_out_conflicts 写：`# moved to <owner> by tcp-dashboard: <原行>`
-# 只匹配 owner=$IPV6_OPT 的行，避免把菜单 3 注释掉的 somaxconn 之类一并解开。
+# 只匹配 owner=$IPV6_OPT 的行，避免把菜单 5 注释掉的 somaxconn 之类一并解开。
 # 用字面量前缀剥离而不是 sed 正则：owner 是路径，含 / . 等，sed 转义极易漏
 # 返回 0=全部解开（或本来就没有）、1=有文件解不开/仍有残留
 restore_ipv6_takeovers() {
@@ -2202,7 +2409,7 @@ restore_ipv6_takeovers() {
         n=$((n + 1))
         echo -e "  已解开 $f 里的 IPv6 接管标记"
     done
-    [ "$n" -gt 0 ] && echo -e "  共恢复 ${GREEN}$n${NC} 个文件里被菜单 i 注释掉的原配置"
+    [ "$n" -gt 0 ] && echo -e "  共恢复 ${GREEN}$n${NC} 个文件里被菜单 3 注释掉的原配置"
     # 兜底：任何残留都算失败（上面某条路径漏计 failed 时也能抓住）
     if grep -rslF "$prefix" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null | grep -q .; then
         failed=1
@@ -2342,13 +2549,13 @@ EOF
 OWNED_KEYS_RE='^[[:space:]]*(net\.(core\.(default_qdisc|somaxconn|netdev_max_backlog|netdev_budget|netdev_budget_usecs|rmem_max|wmem_max|rps_sock_flow_entries)|ipv4\.(tcp_congestion_control|tcp_max_syn_backlog|tcp_syncookies|ip_local_port_range|ip_local_reserved_ports|tcp_rmem|tcp_wmem|tcp_notsent_lowat|tcp_mtu_probing|udp_rmem_min|tcp_slow_start_after_idle|tcp_no_metrics_save|tcp_tw_reuse|tcp_fin_timeout|tcp_fastopen|ip_forward))|fs\.nr_open)[[:space:]]*='
 
 # 关闭 IPv6 的接管正则，与 $IPV6_KEYS 必须覆盖同一组参数。
-# 单列一份而不是并进 OWNED_KEYS_RE：菜单 3/4 不该因为「有人在别的文件里设过 IPv6」
-# 就去注释那些行——它们与内核调优无关，只有菜单 i 才有资格接管
+# 单列一份而不是并进 OWNED_KEYS_RE：菜单 5/6 不该因为「有人在别的文件里设过 IPv6」
+# 就去注释那些行——它们与内核调优无关，只有菜单 3 才有资格接管
 IPV6_OWNED_RE='^[[:space:]]*net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*='
 
 # 把一个文件里命中受管 key 的行注释掉，其余行原样保留。只动冲突行不整文件禁用，
 # 否则会连带停掉同文件里无关的安全参数（如 10-network-security.conf 里的 rp_filter）。
-# 正则与归属文件可传入，供菜单 i 用自己那一组（默认是内核调优那一组）
+# 正则与归属文件可传入，供菜单 3 用自己那一组（默认是内核调优那一组）
 comment_out_conflicts() {
     local target=$1 re=${2:-$OWNED_KEYS_RE} owner=${3:-$SYSCTL_OPT} tmp
     tmp="${target}.tcpdash.tmp"
@@ -2367,7 +2574,7 @@ comment_out_conflicts() {
 
 # 接管 /etc/sysctl.d 下与本脚本冲突的文件，以及 /etc/sysctl.conf 里的冲突行。
 # 一律「逐行注释 + 备份原文件」，不移动、不禁用整个文件。
-# 可传入 <正则> <归属文件> 只接管某一组参数（菜单 i 传自己那组），默认是内核调优那组
+# 可传入 <正则> <归属文件> 只接管某一组参数（菜单 3 传自己那组），默认是内核调优那组
 takeover_conflicts() {
     mkdir -p "$STATE_DIR"
     local re=${1:-$OWNED_KEYS_RE} owner=${2:-$SYSCTL_OPT}
@@ -2624,12 +2831,10 @@ tune_sysctl() {
     fi
     if [ -z "$mbps" ]; then
         if [ "$BATCH" = "1" ]; then
+            # 一键流程里 run_all 已 ask_bandwidth 并写入 TUNE_MBPS；此处兜底 1G
             mbps=1000
         else
-            read -p "  本机出口带宽 Mbps（回车默认 1000）: " mbps
-            case "$mbps" in
-            '' | *[!0-9]*) mbps=1000 ;;
-            esac
+            mbps=$(ask_bandwidth)
         fi
     fi
     [ "$mbps" -lt 1 ] 2>/dev/null || [ -z "$mbps" ] && mbps=1000
@@ -2709,7 +2914,7 @@ tune_sysctl() {
 #   最终取值    $((buf_bytes / 1048576)) MB  <- ${cap_reason}
 #
 # 本机: $(nproc) 核 / $((mem_total_kb / 1024)) MB 内存 / 内核 $(uname -r)
-# 回退: 运行 tcpo 选菜单 6（会连同运行时值一起还原到首次运行前的真实状态）
+# 回退: 运行 tcpo 选菜单 30（会连同运行时值一起还原到首次运行前的真实状态）
 # ==================================================
 
 # --- 队列与拥塞算法 ---
@@ -2736,7 +2941,7 @@ net.ipv4.ip_local_port_range = 32768 65535
 $(if [ -n "$reserved" ]; then
         echo "# 自动保留：以下端口在本次调优时处于监听状态且落在临时端口范围内，"
         echo "# 内核分配随机源端口时会跳过它们，避免业务重启时 bind 失败。"
-        echo "# 新增服务后重跑菜单 3 可刷新此列表。"
+        echo "# 新增服务后重跑菜单 5 可刷新此列表。"
         echo "net.ipv4.ip_local_reserved_ports = ${reserved}"
     else
         echo "# 未检测到落在 32768-65535 内的监听端口，无需保留（ip_local_reserved_ports 留空）"
@@ -2780,7 +2985,7 @@ $(if [ "$PROFILE" = "transit" ]; then
         echo "# 配上不当的防火墙规则可能成为开放中继"
         echo "net.ipv4.ip_forward = 1"
     else
-        echo "# 普通档不开 IP 转发（ip_forward 保持系统原值）。中转/代理/隧道节点请用菜单 4 的中转档"
+        echo "# 普通档不开 IP 转发（ip_forward 保持系统原值）。中转/代理/隧道节点请用菜单 6 的中转档"
     fi)
 
 # --- 可选项：按需自行放开 ---
@@ -2812,7 +3017,7 @@ $(if [ "$PROFILE" = "transit" ]; then
 EOF
     then
         echo -e "  ${RED}写入 $SYSCTL_OPT 失败（磁盘满 / 只读挂载 / 权限），内核参数未配置${NC}"
-        echo -e "  ${YELLOW}已接管的冲突文件备份在 $STATE_DIR，可用菜单 6 回退${NC}"
+        echo -e "  ${YELLOW}已接管的冲突文件备份在 $STATE_DIR，可用菜单 30 回退${NC}"
         pause_return
         return 1
     fi
@@ -2833,7 +3038,7 @@ EOF
     #
     # 两点必须同时成立才对：
     #   1) nr_open 是可写的运行时 sysctl，抬它与抬 somaxconn 是同一类动作，
-    #      归入受管清单后可被 save_original_values 快照、被菜单 6 完整还原；
+    #      归入受管清单后可被 save_original_values 快照、被菜单 30 完整还原；
     #   2) 即使抬不动（容器内 /proc/sys/fs 只读），也绝不低于机器现状——
     #      与 sysctl_ceil 的「只升不降」口径统一。旧写法在这里是单向下调，
     #      与同一个函数里 somaxconn 的处理自相矛盾。
@@ -3135,7 +3340,7 @@ tune_nic() {
     # 「无裸写 cat」的通用机检（它只匹配行首的 cat >），机检判据已一并修正
     if ! ensure_sysctl_dir || ! refuse_if_symlink "$NIC_SYSCTL_OPT" ||
         ! cat >"$NIC_SYSCTL_OPT" <<EOF
-# 由 tcp-dashboard 菜单 5 写入。RFS 全局流表大小，随 CPU 核数计算。
+# 由 tcp-dashboard 菜单 7 写入。RFS 全局流表大小，随 CPU 核数计算。
 # 每队列的 rps_flow_cnt = 本值 / 队列数，由 $NIC_APPLY 在开机时重放。
 net.core.rps_sock_flow_entries = ${flow_entries}
 EOF
@@ -3491,7 +3696,7 @@ apply_live_qdisc() {
         ;;
     esac
     echo -e "  ${YELLOW}  · 队列切换瞬间会丢弃已排队的包（量很小但非零）${NC}"
-    echo -e "  ${YELLOW}  · 重启后由开机单元重放；回退用菜单 6（会 tc qdisc del 恢复内核默认）${NC}"
+    echo -e "  ${YELLOW}  · 重启后由开机单元重放；回退用菜单 30（会 tc qdisc del 恢复内核默认）${NC}"
     if [ "$BATCH" != "1" ]; then
         read -p "  确认执行？[y/N]: " _c
         [[ "$_c" =~ ^[Yy]$ ]] || {
@@ -3587,7 +3792,7 @@ diagnose() {
         echo -e "  可用算法     : ${CYAN}${avail_cc}${NC}"
         case " $avail_cc " in
         *" bbr "*) ;;
-        *) echo -e "    ${YELLOW}=> 列表里没有 bbr：本内核未编入或模块未加载，菜单 2 会尝试 modprobe tcp_bbr${NC}" ;;
+        *) echo -e "    ${YELLOW}=> 列表里没有 bbr：本内核未编入或模块未加载，菜单 4 会尝试 modprobe tcp_bbr${NC}" ;;
         esac
     fi
     echo -e "  default_qdisc: ${CYAN}${qdisc}${NC}"
@@ -3596,7 +3801,7 @@ diagnose() {
     # [人工决策-2026-08-05 10:32:41] 早期版本只取 tc 输出第一行的 root 去比 default_qdisc，
     # 在任何多队列网卡上都必然报「不一致」——实测 root=mq / default_qdisc=fq_codel 即触发。
     # 改为 root 是 mq/mqprio 时以叶子类型为判据，且不自动执行 tc qdisc replace：
-    # tc 改动是运行时的、重启即失效，要做就得配持久化，属菜单 c 的职责，诊断保持只读
+    # tc 改动是运行时的、重启即失效，要做就得配持久化，属菜单 8 的职责，诊断保持只读
     local live_root live_leaf effective
     if [ -n "$dev" ]; then
         IFS=$'\t' read -r live_root live_leaf <<<"$(qdisc_kinds "$dev")"
@@ -3626,7 +3831,7 @@ diagnose() {
         if [ -n "$effective" ] && [ -n "$qdisc" ] && [ "$effective" != "$qdisc" ]; then
             echo -e "    ${YELLOW}=> 与 default_qdisc（$qdisc）不一致${NC}"
             echo -e "    ${YELLOW}   default_qdisc 只影响之后新建的队列。重启即生效；${NC}"
-            echo -e "    ${YELLOW}   要立刻生效用菜单 c（会逐个队列替换，不动 mq 本身）${NC}"
+            echo -e "    ${YELLOW}   要立刻生效用菜单 8（会逐个队列替换，不动 mq 本身）${NC}"
         elif [ -n "$effective" ]; then
             echo -e "    ${GREEN}=> 与 default_qdisc 一致${NC}"
         fi
@@ -3673,7 +3878,7 @@ diagnose() {
                 "${applim:-0}" "${nconn:-0}" "$app_pct"
             # 判定顺序：缓冲区受限（本机能调）优先，再对端，最后应用层
             if [ "$snd_pct" -ge 10 ]; then
-                echo -e "    ${GREEN}=> 发送缓冲是瓶颈：加大 wmem 有效，本脚本菜单 3 正对这个问题${NC}"
+                echo -e "    ${GREEN}=> 发送缓冲是瓶颈：加大 wmem 有效，本脚本菜单 5 正对这个问题${NC}"
             elif [ "$rwnd_pct" -ge 10 ]; then
                 echo -e "    ${YELLOW}=> 对端接收窗口是瓶颈：本机调 sysctl 无效，要对端也调或换对端${NC}"
             elif [ "$app_pct" -ge 50 ]; then
@@ -3777,7 +3982,7 @@ diagnose() {
         fi
 
         # --- tcp_mtu_probing 到底有没有真的触发过 ---
-        # 菜单 3/b 都是主动探测，这两个计数器反映真实业务连接的情况：非零说明路径确有黑洞且参数在起作用，
+        # 菜单 5/22 都是主动探测，这两个计数器反映真实业务连接的情况：非零说明路径确有黑洞且参数在起作用，
         # 比 ICMP 阶梯更可信（ICMP 可能被单独屏蔽，这是 TCP 自己的数据）
         local mtup_ok mtup_fail
         mtup_ok=$(counter_get TcpExtTCPMTUPSuccess "$snap_a")
@@ -3786,9 +3991,9 @@ diagnose() {
             if [ "${mtup_ok:-0}" -gt 0 ] 2>/dev/null || [ "${mtup_fail:-0}" -gt 0 ] 2>/dev/null; then
                 echo -e "  ${CYAN}MTU 探测实际触发${NC}: 成功 ${mtup_ok:--} / 失败 ${mtup_fail:--}"
                 echo -e "    ${GREEN}=> 非零说明路径上确有 MTU 黑洞，且 tcp_mtu_probing=1 正在起作用${NC}"
-                echo -e "    ${GREEN}   这是真实业务连接的证据，比菜单 b 的 ICMP 阶梯更可信${NC}"
+                echo -e "    ${GREEN}   这是真实业务连接的证据，比菜单 22 的 ICMP 阶梯更可信${NC}"
                 [ "${mtup_fail:-0}" -gt "${mtup_ok:-0}" ] 2>/dev/null &&
-                    echo -e "    ${YELLOW}   但失败多于成功：探测收敛不下去，可考虑菜单 b 找出实际 PMTU${NC}"
+                    echo -e "    ${YELLOW}   但失败多于成功：探测收敛不下去，可考虑菜单 22 找出实际 PMTU${NC}"
             else
                 echo -e "  ${CYAN}MTU 探测实际触发${NC}: 0（本机连接没遇到过 MTU 黑洞）"
                 echo -e "    ${GREEN}=> tcp_mtu_probing=1 是保险，没触发说明路径 MTU 干净${NC}"
@@ -3894,7 +4099,7 @@ diagnose() {
             printf "    接收缓冲溢出 (UdpRcvbufErrors): %s\n" "${udprcv:--}"
             printf "    发送缓冲溢出 (UdpSndbufErrors): %s\n" "${udpsnd:--}"
             [ "${udprcv:-0}" -gt 0 ] 2>/dev/null &&
-                echo -e "    ${YELLOW}=> 接收缓冲溢出过：udp_rmem_min 与 rmem_max 加大有意义（本脚本菜单 3 已设）${NC}"
+                echo -e "    ${YELLOW}=> 接收缓冲溢出过：udp_rmem_min 与 rmem_max 加大有意义（本脚本菜单 5 已设）${NC}"
             if [ "${udpin:-0}" -gt 1000 ] 2>/dev/null && [ "${udperr:-0}" -gt 0 ] 2>/dev/null; then
                 local uerr_pct=$((udperr * 1000 / udpin))
                 printf "    InErrors/InDatagrams         : %s.%s%%  (%s / %s)\n" \
@@ -3926,7 +4131,7 @@ diagnose() {
     fi
 
     # --- NET_RX 软中断分布：RPS 该不该开的直接证据 ---
-    # 菜单 5 只按硬件队列数<核数判断能力，不代表软中断真成了瓶颈；真正证据是 NET_RX
+    # 菜单 7 只按硬件队列数<核数判断能力，不代表软中断真成了瓶颈；真正证据是 NET_RX
     # 是否集中在少数核上，全核均摊时开 RPS 只会多一次 IPI 反而抬高延迟（内核 scaling.rst）
     if [ -r /proc/softirqs ]; then
         local rx_stat
@@ -3948,7 +4153,7 @@ diagnose() {
             if [ "${rx_n:-1}" -le 1 ]; then
                 echo -e "    ${YELLOW}=> 单核机器，RPS 无意义（没有其他核可以分摊）${NC}"
             elif [ "$rx_pct" -ge $((300 / rx_n)) ] && [ "$rx_pct" -ge 40 ]; then
-                echo -e "    ${GREEN}=> 明显集中在单核：RPS/RFS 有实际意义，菜单 5 正对这个问题${NC}"
+                echo -e "    ${GREEN}=> 明显集中在单核：RPS/RFS 有实际意义，菜单 7 正对这个问题${NC}"
             else
                 echo -e "    ${YELLOW}=> 分布较均匀（均摊值约 $((100 / rx_n))%），软中断不是瓶颈，开 RPS 收益有限${NC}"
             fi
@@ -3991,7 +4196,7 @@ diagnose() {
                     echo -e "    MSS clamp: ${GREEN}规则在${NC}"
                 else
                     echo -e "    ${YELLOW}MSS clamp: 规则不在（iptables 规则重启即失效）${NC}"
-                    echo -e "    ${YELLOW}  转发已开但 clamp 没了，隧道路径可能出现 MTU 黑洞。重跑菜单 4 可补回${NC}"
+                    echo -e "    ${YELLOW}  转发已开但 clamp 没了，隧道路径可能出现 MTU 黑洞。重跑菜单 6 可补回${NC}"
                 fi
             fi
         else
@@ -4299,14 +4504,902 @@ probe_mtu() {
     pause_return
 }
 
+
+# ==================================================
+# --- 带宽交互 / 公共测速节点 / 限速器拐点 / HTB 整形 ---
+# [人工决策-2026-08-17 14:26:33] 引入 HTB 出向整形 + 近端 policer 拐点扫描。
+# 依据：ports 上的突发限速器会把 BBR 打穿导致重传爆炸；限在拐点下 + fq pacing 可把
+# 「不限速高吞吐高重传」变成「略低吞吐极低重传」。不设 initcwnd（仍故意不设）。
+# 一键默认带扫描；公共节点全挂/用户拒装 iperf3 时只跳过整形，基础调优保留。
+# 内置公共 iperf3 表 + 自动选最近 + 可手填；扫失败不回滚已写 sysctl。
+
+# ==================================================
+# 设计取自 tcpfit 的实测路径，按 tcpo 边界改写：
+#   · 不设 initcwnd（故意不设，见 sysctl 注释区）
+#   · 扫失败不回滚已生效的基础调优
+#   · 公共节点可关可手填；装 iperf3 必问（真流量）
+#   · 整形持久化走独立 unit，回退/shape off 都能清干净
+
+# 交互选出口带宽。VPS 商家常说 100M/1G，不是「1000 Mbps」。
+# 输出纯 Mbps 整数到 stdout。TUNE_MBPS 已设时调用方不应再调本函数。
+# 交互选带宽。UI 一律 stderr；stdout 只吐纯数字——调用方是 bw=$(ask_bandwidth)，
+# 提示进 stdout 会被吃进变量，菜单文案和数字搅在一起（WSL 实测已踩）。
+ask_bandwidth() {
+    local ans
+    echo -e "  本机出口带宽（按 BDP 算缓冲区；商家套餐常写 100M / 1G）：" >&2
+    echo -e "    ${CYAN}1${NC}) 100 Mbps" >&2
+    echo -e "    ${CYAN}2${NC}) 200 Mbps" >&2
+    echo -e "    ${CYAN}3${NC}) 500 Mbps" >&2
+    echo -e "    ${CYAN}4${NC}) 1 Gbps     ${GREEN}[回车默认]${NC}" >&2
+    echo -e "    ${CYAN}5${NC}) 2.5 Gbps" >&2
+    echo -e "    ${CYAN}6${NC}) 10 Gbps" >&2
+    echo -e "    ${CYAN}0${NC}) 手动输入 Mbps 数字" >&2
+    read -p "  选择 [0-6，回车默认 4]: " ans || true
+    case "$ans" in
+    1) echo 100 ;;
+    2) echo 200 ;;
+    3) echo 500 ;;
+    4 | '') echo 1000 ;;
+    5) echo 2500 ;;
+    6) echo 10000 ;;
+    0)
+        read -p "  请输入 Mbps 正整数: " ans || true
+        case "$ans" in '' | *[!0-9]*) echo 1000 ;; *) echo "$ans" ;; esac
+        ;;
+    *)
+        # 直接敲 Mbps 数字
+        case "$ans" in
+        *[!0-9]*) echo 1000 ;;
+        *) echo "$ans" ;;
+        esac
+        ;;
+    esac
+}
+
+# 公共 iperf3 节点（测的是本机端口上限，越近越准；非国内回程速度）
+# 主机|城市|提供方
+PEER_POOL="
+speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
+speedtest.sin1.sg.leaseweb.net|新加坡|Leaseweb
+sgp.proof.ovh.net|新加坡|OVH
+speedtest.syd12.au.leaseweb.net|悉尼|Leaseweb
+speedtest.tyo11.jp.leaseweb.net|东京|Leaseweb
+speedtest.fra1.de.leaseweb.net|法兰克福|Leaseweb
+speedtest.ams2.nl.leaseweb.net|阿姆斯特丹|Leaseweb
+ams.speedtest.clouvider.net|阿姆斯特丹|Clouvider
+speedtest.lon12.uk.leaseweb.net|伦敦|Leaseweb
+lon.speedtest.clouvider.net|伦敦|Clouvider
+speedtest.lax12.us.leaseweb.net|洛杉矶|Leaseweb
+speedtest.sfo12.us.leaseweb.net|旧金山|Leaseweb
+speedtest.sea11.us.leaseweb.net|西雅图|Leaseweb
+speedtest.dal13.us.leaseweb.net|达拉斯|Leaseweb
+speedtest.chi11.us.leaseweb.net|芝加哥|Leaseweb
+speedtest.nyc1.us.leaseweb.net|纽约|Leaseweb
+speedtest.mia11.us.leaseweb.net|迈阿密|Leaseweb
+speedtest.mtl2.ca.leaseweb.net|蒙特利尔|Leaseweb
+"
+# Leaseweb/OVH 5201-5210，Clouvider 5200-5209；5200 放末尾避免 Leaseweb 先白撞
+PORT_POOL="5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200"
+PROBE_PORTS="5201 5202 5203 5200"
+IP_FAMILY="${IP_FAMILY:--4}"
+PEER_PORT="${PEER_PORT:-5201}"
+PEER_IDEAL_RTT="${TCPO_PEER_IDEAL_RTT:-50}"
+PEER_MAX_RTT="${TCPO_PEER_MAX_RTT:-100}"
+SWEEP_CAP="${TCPO_SWEEP_CAP:-2500}"
+
+# 按对端选 iperf3/ping 协议族，写入全局 IP_FAMILY（仅本轮扫描有效）。
+# - 字面 IPv6（含 :）→ -6
+# - 字面 IPv4 → -4
+# - 主机名：解析到 A 用 -4；仅有 AAAA 用 -6；解析失败默认 -4
+# 公共节点自动选点不走这里，见 auto_pick_peer 入口强制 -4。
+set_ip_family_for_host() {
+    local host=$1 line
+    case "$host" in
+    *:*)
+        IP_FAMILY=-6
+        return 0
+        ;;
+    esac
+    # 点分 IPv4
+    case "$host" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+        if printf '%s' "$host" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            IP_FAMILY=-4
+            return 0
+        fi
+        ;;
+    esac
+    # 主机名：优先看解析结果，避免「只填域名、仅有 AAAA」仍死磕 -4
+    if command -v getent >/dev/null 2>&1; then
+        if getent ahostsv4 "$host" 2>/dev/null | awk 'NF{found=1; exit} END{exit !found}'; then
+            IP_FAMILY=-4
+            return 0
+        fi
+        if getent ahostsv6 "$host" 2>/dev/null | awk 'NF{found=1; exit} END{exit !found}'; then
+            IP_FAMILY=-6
+            return 0
+        fi
+        # ahostsv4/v6 不可用时退回 ahosts 看首条
+        line=$(getent ahosts "$host" 2>/dev/null | awk 'NF{print $1; exit}')
+        case "$line" in
+        *:*)
+            IP_FAMILY=-6
+            return 0
+            ;;
+        ?*)
+            IP_FAMILY=-4
+            return 0
+            ;;
+        esac
+    fi
+    IP_FAMILY=-4
+}
+
+port_order() {
+    local p out="$1"
+    for p in $PORT_POOL; do [ "$p" = "$1" ] || out="$out $p"; done
+    echo "$out"
+}
+
+# 返回 0 并把可用端口写到 PROBE_PORT_OK。始终走 tcp_connect_ok（自带墙钟上限）。
+probe_peer_port() {
+    local host="$1" try
+    PROBE_PORT_OK=""
+    for try in $PROBE_PORTS; do
+        if tcp_connect_ok "$host" "$try"; then
+            PROBE_PORT_OK=$try
+            return 0
+        fi
+    done
+    return 1
+}
+
+# stdout: host:port；失败 return 1。进度打 stderr。
+# 公共节点表固定 IPv4 探测，入口强制 -4，避免上次手填 IPv6 把全局 IP_FAMILY 带偏。
+auto_pick_peer() {
+    local cand name prov rtt tmpd sorted best="" fallback="" fallback_rtt=""
+    IP_FAMILY=-4
+    if ! command -v ping >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}本机缺 ping，无法自动选公共节点（ensure_tools 应已装；或手填对端）${NC}" >&2
+        return 1
+    fi
+    echo -e "  ${CYAN}自动选择近端 iperf3 节点（测端口上限，越近越准）…${NC}" >&2
+    tmpd=$(mktemp -d 2>/dev/null) || return 1
+    while IFS='|' read -r cand name prov; do
+        [ -z "$cand" ] && continue
+        (
+            r=$(ping $IP_FAMILY -c 2 -q -W 2 "$cand" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%.0f", $5}')
+            [ -n "$r" ] && printf '%s %s %s %s\n' "$r" "$cand" "$name" "$prov" >"$tmpd/$cand"
+        ) &
+    done <<<"$PEER_POOL"
+    wait
+    sorted=$(cat "$tmpd"/* 2>/dev/null | sort -n)
+    rm -rf "$tmpd"
+    [ -n "$sorted" ] || {
+        echo -e "  ${YELLOW}全部公共节点 ping 不通${NC}" >&2
+        return 1
+    }
+    while read -r rtt cand name prov; do
+        [ -z "$cand" ] && continue
+        if [ "$rtt" -gt "$PEER_MAX_RTT" ] 2>/dev/null; then
+            printf '    %-36s %-8s RTT %sms  太远跳过\n' "$cand" "$name" "$rtt" >&2
+            continue
+        fi
+        printf '    %-36s %-8s RTT %sms  ' "$cand" "$name" "$rtt" >&2
+        if ! probe_peer_port "$cand"; then
+            echo "端口不通" >&2
+            continue
+        fi
+        local pport="$PROBE_PORT_OK" gp="" try
+        if ! command -v iperf3 >/dev/null 2>&1; then
+            echo -e "${GREEN}可达 :$pport${NC}" >&2
+            echo "$cand:$pport"
+            return 0
+        fi
+        for try in $(port_order "$pport"); do
+            if timeout 15 iperf3 $IP_FAMILY -c "$cand" -p "$try" -t 2 -P 1 >/dev/null 2>&1; then
+                gp=$try
+                break
+            fi
+        done
+        if [ -n "$gp" ]; then
+            if [ "$rtt" -le "$PEER_IDEAL_RTT" ] 2>/dev/null; then
+                echo -e "${GREEN}可用 :$gp${NC}" >&2
+                echo "$cand:$gp"
+                return 0
+            fi
+            echo "可用 :$gp（偏远，作备选）" >&2
+            [ -z "$fallback" ] && {
+                fallback="$cand:$gp"
+                fallback_rtt=$rtt
+            }
+        else
+            echo "全端口忙" >&2
+        fi
+    done <<<"$sorted"
+    if [ -n "$fallback" ]; then
+        echo -e "  ${YELLOW}最近可用对端 RTT ${fallback_rtt}ms（理想 ≤${PEER_IDEAL_RTT}ms），拐点可能偏保守${NC}" >&2
+        echo "$fallback"
+        return 0
+    fi
+    echo -e "  ${YELLOW}没有 ${PEER_MAX_RTT}ms 内空闲的公共节点；可手填自建 iperf3 -s 地址${NC}" >&2
+    return 1
+}
+
+# 问对端：回车自动选；填 IP/域名用手填。UI → stderr，stdout 只吐 host:port
+ask_peer() {
+    local ans picked host port bare_host=0
+    echo -e "  测速对端（近端 iperf3，测本机端口上限不是回国速度）：" >&2
+    echo -e "    回车 = 自动选最近公共节点" >&2
+    echo -e "    或填 主机 或 主机:端口（IPv6 可用 2001:db8::1 / [2001:db8::1] / [2001:db8::1]:5201）" >&2
+    read -p "  对端: " ans || true
+    if [ -z "$ans" ]; then
+        picked=$(auto_pick_peer) || return 1
+        echo "$picked"
+        return 0
+    fi
+    # 去掉首尾空白
+    ans=${ans#"${ans%%[![:space:]]*}"}
+    ans=${ans%"${ans##*[![:space:]]}"}
+    case "$ans" in
+    \[*\]:*)
+        # [2001:db8::1]:5201
+        host=${ans#\[}
+        host=${host%%\]:*}
+        port=${ans##*:}
+        ;;
+    \[*\])
+        # [2001:db8::1] 无端口 → 默认/探测
+        host=${ans#\[}
+        host=${host%\]}
+        port=5201
+        bare_host=1
+        ;;
+    *:*)
+        # 区分「hostname:port / IPv4:port」与「裸 IPv6（含多个 :）」
+        case "$ans" in
+        *:*:*)
+            # 多个冒号：裸 IPv6 主机，默认端口
+            host=$ans
+            port=5201
+            bare_host=1
+            ;;
+        *)
+            host=${ans%:*}
+            port=${ans##*:}
+            ;;
+        esac
+        ;;
+    *)
+        host=$ans
+        port=5201
+        bare_host=1
+        ;;
+    esac
+    # 格式闸：只许主机名/IP 字符集，拒绝 shell 元字符（审查：命令注入）
+    # 裸 IPv6 允许冒号；方括号已在上面剥掉
+    case "$host" in
+    '' | *[!A-Za-z0-9._:-]*)
+        echo -e "  ${RED}对端主机名不合法（只允许字母数字 . _ : -）${NC}" >&2
+        return 1
+        ;;
+    esac
+    case "$port" in
+    '' | *[!0-9]*)
+        echo -e "  ${RED}对端端口不合法（须为 1-65535 的数字）${NC}" >&2
+        return 1
+        ;;
+    esac
+    if [ "$port" -lt 1 ] 2>/dev/null || [ "$port" -gt 65535 ] 2>/dev/null; then
+        echo -e "  ${RED}对端端口超出范围${NC}" >&2
+        return 1
+    fi
+    # 未显式写端口：探测可用口（探测函数内部同样校验）
+    if [ "$bare_host" = "1" ]; then
+        if probe_peer_port "$host"; then
+            port=$PROBE_PORT_OK
+        fi
+    fi
+    echo "$host:$port"
+}
+
+
+# 跑 iperf3：stdout "发送Mbps 重传 接收Mbps"；失败空
+run_iperf() {
+    local peer="$1" dur="$2" par="$3" first="${4:-$PEER_PORT}"
+    local port out tmp sg rt rg try
+    command -v iperf3 >/dev/null 2>&1 || return 1
+    tmp=$(mktemp 2>/dev/null) || return 1
+    for try in $(port_order "$first"); do
+        if timeout $((dur + 20)) iperf3 $IP_FAMILY -c "$peer" -p "$try" -t "$dur" -P "$par" -f m >"$tmp" 2>&1; then
+            # sender 汇总行
+            sg=$(awk '/sender$/{print $7; exit}' "$tmp")
+            rt=$(awk '/sender$/{print $9; exit}' "$tmp")
+            rg=$(awk '/receiver$/{print $7; exit}' "$tmp")
+            [ -n "$rg" ] || rg=$sg
+            # 单位可能是 Mbits/sec；-f m 保证是 Mbits
+            case "$sg" in '' | *[!0-9.]*) continue ;; esac
+            case "$rt" in '' | *[!0-9]*) rt=0 ;; esac
+            rm -f "$tmp"
+            printf '%s %s %s\n' "$sg" "$rt" "$rg"
+            PEER_PORT=$try
+            return 0
+        fi
+    done
+    rm -f "$tmp"
+    return 1
+}
+
+# 丢包率%（近似）：重传 / (吞吐Mbps * 秒 * 1e6/8/1500) —— 用 tcpfit 同款简化
+# loss_pct <重传> <吞吐Mbps> <秒>
+loss_pct() {
+    awk -v rt="$1" -v mbps="$2" -v sec="$3" 'BEGIN{
+        segs = mbps * 1000000 / 8 / 1500 * sec
+        if (segs < 1) segs = 1
+        printf "%.4f", rt * 100 / segs
+    }'
+}
+
+calc_burst() {
+    awk -v r="$1" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%d", v}'
+}
+
+calc_shape_margin() {
+    local bw="$1"
+    if [ "$bw" -le 30 ] 2>/dev/null; then echo 1
+    elif [ "$bw" -le 60 ] 2>/dev/null; then echo 2
+    elif [ "$bw" -le 100 ] 2>/dev/null; then echo 5
+    elif [ "$bw" -le 300 ] 2>/dev/null; then echo 10
+    elif [ "$bw" -le 600 ] 2>/dev/null; then echo 15
+    elif [ "$bw" -le 1000 ] 2>/dev/null; then echo 25
+    else echo 40
+    fi
+}
+
+# 临时装 HTB 测试结构（与持久化脚本一致）
+apply_test_shaper() {
+    local iface="$1" rate="$2" burst
+    burst=$(calc_burst "$rate")
+    tc qdisc del dev "$iface" root 2>/dev/null || true
+    tc qdisc add dev "$iface" root handle 1: htb default 10 2>/dev/null || return 1
+    tc class add dev "$iface" parent 1: classid 1:10 htb \
+        rate "${rate}mbit" ceil "${rate}mbit" burst "$burst" cburst "$burst" quantum 1514 2>/dev/null || return 1
+    tc qdisc add dev "$iface" parent 1:10 handle 10: fq \
+        limit 40960 flow_limit 8192 maxrate "${rate}mbit" 2>/dev/null || return 1
+}
+
+# 读 HTB class 速率为 Mbps（处理 tc 显示 Gbit）
+tc_rate_mbit() {
+    printf '%s' "$1" | awk '
+    {
+      for(i=1;i<=NF;i++) if($i=="rate"){
+        v=$(i+1)
+        if (v ~ /Gbit/) { gsub(/Gbit/,"",v); printf "%.0f", v*1000; exit }
+        if (v ~ /Mbit/) { gsub(/Mbit/,"",v); printf "%.0f", v; exit }
+        if (v ~ /Kbit/) { gsub(/Kbit/,"",v); printf "%.0f", v/1000; exit }
+        if (v ~ /bit/)  { gsub(/bit/,"",v);  printf "%.0f", v/1000000; exit }
+      }
+    }'
+}
+
+# 写持久化 shape 脚本 + unit 并应用
+shape_apply() {
+    local rate="$1" iface
+    take_tcpo_lock || return 1
+    iface=$(egress_dev)
+    [ -n "$iface" ] || {
+        echo -e "  ${RED}识别不出出口网卡${NC}"
+        return 1
+    }
+    is_posint_shape "$rate" 1 100000 || {
+        echo -e "  ${RED}整形速率必须是 1-100000 的整数 Mbps${NC}"
+        return 1
+    }
+    if dryrun_skip "写入 HTB 整形 ${rate}Mbit @ $iface"; then
+        mkdir -p "$STATE_DIR"
+        if ! printf '%s\n' "$rate" | atomic_write "$SHAPE_RATE"; then
+            echo -e "  ${RED}演练写入 $SHAPE_RATE 失败${NC}"
+            return 1
+        fi
+        return 0
+    fi
+    if ! command -v tc >/dev/null 2>&1; then
+        ensure_tools tc >/dev/null
+        command -v tc >/dev/null 2>&1 || {
+            echo -e "  ${RED}tc 不可用，无法整形${NC}"
+            return 1
+        }
+    fi
+    mkdir -p "$(dirname "$SHAPE_SCRIPT")" "$STATE_DIR" || {
+        echo -e "  ${RED}无法创建目录${NC}"
+        return 1
+    }
+    # 走 atomic_write：拒绝符号链接、先临时文件再 rename，避免半截脚本被 enable
+    if ! cat <<EOF | atomic_write "$SHAPE_SCRIPT"
+#!/bin/bash
+# 由 tcpo 生成：HTB 聚合限速 + fq 叶子 pacing。回退用菜单 30 或菜单 24 关整形。
+IF=${iface}
+RATE=\${1:-${rate}}
+BURST=\$(awk -v r="\$RATE" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%d",v}')
+tc qdisc del dev \$IF root 2>/dev/null || {
+  tc qdisc replace dev \$IF root handle 1: mq 2>/dev/null || exit 1
+  tc qdisc del dev \$IF root 2>/dev/null || exit 1
+}
+tc qdisc add dev \$IF root handle 1: htb default 10 || exit 1
+tc class add dev \$IF parent 1: classid 1:10 htb rate \${RATE}mbit ceil \${RATE}mbit burst \${BURST} cburst \${BURST} quantum 1514 || exit 1
+tc qdisc add dev \$IF parent 1:10 handle 10: fq limit 40960 flow_limit 8192 maxrate \${RATE}mbit || exit 1
+EOF
+    then
+        echo -e "  ${RED}写入 $SHAPE_SCRIPT 失败（符号链接/磁盘满/只读）${NC}"
+        return 1
+    fi
+    chmod +x "$SHAPE_SCRIPT" || {
+        echo -e "  ${RED}chmod $SHAPE_SCRIPT 失败${NC}"
+        return 1
+    }
+    [ -x "$SHAPE_SCRIPT" ] || {
+        echo -e "  ${RED}$SHAPE_SCRIPT 未落地为可执行文件${NC}"
+        return 1
+    }
+    if has_systemd; then
+        if ! cat <<EOF | atomic_write "$SHAPE_UNIT"
+[Unit]
+Description=tcpo egress HTB shaper
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SHAPE_SCRIPT $rate
+[Install]
+WantedBy=multi-user.target
+EOF
+        then
+            echo -e "  ${RED}写入 $SHAPE_UNIT 失败${NC}"
+            return 1
+        fi
+        [ -f "$SHAPE_UNIT" ] || {
+            echo -e "  ${RED}$SHAPE_UNIT 未落地${NC}"
+            return 1
+        }
+        systemctl daemon-reload >/dev/null 2>&1
+        # enable 失败仍可即时生效，但必须把「未持久化」说清楚，不能只报成功（审查：假持久化）
+        local unit_ok=0
+        if systemctl enable --now "$(basename "$SHAPE_UNIT")" >/dev/null 2>&1; then
+            unit_ok=1
+        else
+            "$SHAPE_SCRIPT" "$rate" || return 1
+        fi
+    else
+        "$SHAPE_SCRIPT" "$rate" || return 1
+        local unit_ok=0
+        echo -e "  ${YELLOW}无 systemd：整形已即时生效，重启后需重放 $SHAPE_SCRIPT $rate${NC}"
+    fi
+    local applied
+    applied=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)")
+    if [ -n "$applied" ] && awk -v a="$applied" -v r="$rate" 'BEGIN{exit !(a>r*0.99 && a<r*1.01)}'; then
+        if ! printf '%s\n' "$rate" | atomic_write "$SHAPE_RATE"; then
+            echo -e "  ${RED}写入 $SHAPE_RATE 失败（符号链接/磁盘满/只读）；运行时已整形但状态文件未落地${NC}"
+            return 1
+        fi
+        if [ "${unit_ok:-0}" = "1" ]; then
+            echo -e "  ${GREEN}已应用 HTB ${rate} Mbit + fq pacing @ ${iface}（已持久化）${NC}"
+        elif has_systemd; then
+            echo -e "  ${YELLOW}已应用 HTB ${rate} Mbit @ ${iface}，但 unit 未 enable 成功——重启后会丢，请检查 systemctl status $(basename "$SHAPE_UNIT")${NC}"
+        else
+            echo -e "  ${GREEN}已应用 HTB ${rate} Mbit + fq pacing @ ${iface}${NC}"
+        fi
+        return 0
+    fi
+    echo -e "  ${YELLOW}整形命令已执行但读回速率不符（当前 ${applied:-?} Mbit），请 tc class show dev $iface 核对${NC}"
+    # 速率不符也尝试落状态，失败则明确报；不裸重定向
+    if ! printf '%s\n' "$rate" | atomic_write "$SHAPE_RATE"; then
+        echo -e "  ${RED}写入 $SHAPE_RATE 失败${NC}"
+    fi
+    return 1
+}
+
+shape_off() {
+    local iface
+    take_tcpo_lock || return 1
+    iface=$(egress_dev)
+    if dryrun_skip "移除 HTB 整形"; then
+        rm -f "$SHAPE_RATE" "$SWEEP_RESULT"
+        return 0
+    fi
+    if has_systemd && [ -f "$SHAPE_UNIT" ]; then
+        systemctl disable --now "$(basename "$SHAPE_UNIT")" >/dev/null 2>&1
+        rm -f "$SHAPE_UNIT"
+        systemctl daemon-reload >/dev/null 2>&1
+    fi
+    rm -f "$SHAPE_SCRIPT" "$SHAPE_RATE" "$SWEEP_RESULT"
+    [ -n "$iface" ] || {
+        echo -e "  ${GREEN}整形配置已清除${NC}"
+        return 0
+    }
+    # 拆 HTB 后走 restore_default_qdisc：多队列会回到 mq + 叶子 default_qdisc
+    local restore_rc=0
+    if command -v tc >/dev/null 2>&1; then
+        local root
+        root=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1{print $2}')
+        case "$root" in
+        htb)
+            restore_default_qdisc "$iface" || restore_rc=1
+            ;;
+        esac
+    fi
+    if [ "$restore_rc" = "0" ]; then
+        echo -e "  ${GREEN}整形已移除；BBR/缓冲区等基础调优未动${NC}"
+        return 0
+    fi
+    echo -e "  ${RED}整形配置文件已删，但 qdisc 恢复失败——请手动: tc qdisc show dev $iface${NC}"
+    return 1
+}
+
+
+is_posint_shape() {
+    case "$1" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$1" -ge "$2" ] 2>/dev/null && [ "$1" -le "$3" ] 2>/dev/null
+}
+
+# 菜单 24：应用/移除整形
+menu_shape() {
+    echo -e "\n${YELLOW}>>> 出向整形（HTB + fq pacing）${NC}"
+    local cur iface
+    iface=$(egress_dev)
+    cur=""
+    [ -n "$iface" ] && cur=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)")
+    if [ -n "$cur" ]; then
+        echo -e "  当前整形: ${GREEN}${cur} Mbit${NC} @ ${iface}"
+    else
+        echo -e "  当前整形: ${YELLOW}未设置${NC}"
+    fi
+    echo -e "    ${CYAN}1${NC}) 应用整形（手填 Mbps）"
+    echo -e "    ${CYAN}2${NC}) 移除整形（保留基础调优）"
+    echo -e "    ${CYAN}0${NC}) 返回"
+    local c
+    read -p "  选择: " c || true
+    case "$c" in
+    1)
+        local r
+        read -p "  整形上限 Mbps: " r || true
+        shape_apply "$r"
+        ;;
+    2) shape_off ;;
+    *) echo -e "  已取消" ;;
+    esac
+    pause_return
+}
+
+# 限速器拐点扫描。成功时写 $SWEEP_RESULT（KNEE/RECOMMEND/NO_KNEE 等）
+# 返回 0=有推荐整形值  3=确认无拐点/超上限  1=失败
+sweep_policer() {
+    local peer="$1" nominal="$2" iface dur=10 par=1 thresh=0.1 GAP=3
+    local res sgp rt gp lp base_loss="" last_ok="" broke_at=""
+    local unshaped_mbps unshaped_loss margin rec knee
+    take_tcpo_lock || return 1
+    iface=$(egress_dev)
+    [ -n "$iface" ] || {
+        echo -e "  ${RED}无出口网卡${NC}"
+        return 1
+    }
+    [ -n "$peer" ] || {
+        echo -e "  ${RED}无对端${NC}"
+        return 1
+    }
+    case "$nominal" in '' | *[!0-9]*) nominal=1000 ;; esac
+    mkdir -p "$STATE_DIR"
+    rm -f "$SWEEP_RESULT"
+
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}拐点扫描需要 iperf3（会产生真实上行流量）${NC}"
+        drain_stdin
+        if [ "$BATCH" = "1" ]; then
+            read -p "  现在安装 iperf3？[y/N]: " _ins || true
+            [[ "$_ins" =~ ^[Yy]$ ]] || {
+                echo -e "  ${YELLOW}跳过整形扫描（基础调优不受影响）${NC}"
+                return 1
+            }
+            ensure_tools iperf3 >/dev/null
+        else
+            read -p "  现在安装 iperf3？[y/N]: " _ins || true
+            [[ "$_ins" =~ ^[Yy]$ ]] || {
+                echo -e "  ${YELLOW}已取消扫描${NC}"
+                return 1
+            }
+            ensure_tools iperf3 >/dev/null
+        fi
+        command -v iperf3 >/dev/null 2>&1 || {
+            echo -e "  ${RED}iperf3 不可用${NC}"
+            return 1
+        }
+    fi
+    if ! command -v tc >/dev/null 2>&1; then
+        ensure_tools tc >/dev/null
+        command -v tc >/dev/null 2>&1 || {
+            echo -e "  ${RED}tc 不可用${NC}"
+            return 1
+        }
+    fi
+
+    local host=${peer%:*} pport=${peer##*:}
+    [ "$host" = "$pport" ] && pport=$PEER_PORT
+    PEER_PORT=$pport
+    set_ip_family_for_host "$host"
+    if [ "$IP_FAMILY" = "-6" ]; then
+        echo -e "  ${CYAN}对端走 IPv6（iperf3 -6）${NC}"
+    fi
+
+    echo -e "  对端 ${CYAN}${host}:${PEER_PORT}${NC}  标称 ${CYAN}${nominal}${NC} Mbps  网卡 ${CYAN}${iface}${NC}"
+    echo -e "  ${YELLOW}扫描会产生真实上行流量；中断(Ctrl-C)会尽量恢复 qdisc${NC}"
+
+    # 扫描会临时换 root qdisc；退出/中断必须恢复。
+    # 有持久化整形 → 重放 SHAPE_SCRIPT；否则 restore_default_qdisc（保 mq）。
+    local had_shape=0
+    [ -x "$SHAPE_SCRIPT" ] && [ -f "$SHAPE_RATE" ] && had_shape=1
+    restore_q() {
+        local rc=0
+        if [ "$had_shape" = "1" ] && [ -x "$SHAPE_SCRIPT" ] && [ -f "$SHAPE_RATE" ]; then
+            "$SHAPE_SCRIPT" "$(cat "$SHAPE_RATE" 2>/dev/null)" 2>/dev/null || restore_default_qdisc "$iface" || rc=1
+        else
+            restore_default_qdisc "$iface" || rc=1
+        fi
+        if [ "$rc" != "0" ]; then
+            echo -e "  ${RED}qdisc 恢复失败，请检查: tc qdisc show dev $iface${NC}" >&2
+        fi
+        return "$rc"
+    }
+    trap 'echo; echo -e "  ${YELLOW}中断，恢复 qdisc…${NC}"; restore_q; trap - INT TERM; return 130' INT TERM
+
+    # —— 1) 不限速基线 ——
+    echo -e "\n  ${CYAN}[1/3] 不限速基线（判断有没有端口限速器）${NC}"
+    # 基线只要「不是 HTB」：已在 pfifo_fast/fq/mq 上直接测。
+    # 只有当前是 htb 才强制拆；否则 restore 会为了追 sysctl 的 fq 去 replace，
+    # 在 WSL 虚拟网卡上常失败，误杀整次扫描（sysctl=fq 但运行时只能 pfifo_fast）。
+    _bl_root=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1{print $2}')
+    if [ "$_bl_root" = "htb" ]; then
+        if ! restore_default_qdisc "$iface"; then
+            echo -e "  ${RED}基线前无法拆掉 HTB，中止扫描（qdisc 状态不对测拐点会失真）${NC}"
+            echo -e "  ${YELLOW}可先菜单 24 关整形，或检查: tc qdisc show dev $iface${NC}"
+            trap - INT TERM
+            return 1
+        fi
+    fi
+    res=$(run_iperf "$host" "$dur" 1 "$PEER_PORT") || res=""
+    if [ -z "$res" ]; then
+        echo -e "  ${RED}基线测速失败（对端忙或不可达）${NC}"
+        restore_q
+        trap - INT TERM
+        return 1
+    fi
+    sgp=$(echo "$res" | awk '{print $1}')
+    rt=$(echo "$res" | awk '{print $2}')
+    gp=$(echo "$res" | awk '{print $3}')
+    lp=$(loss_pct "$rt" "$sgp" "$dur")
+    unshaped_mbps=$gp
+    unshaped_loss=$lp
+    echo -e "  不限速: 吞吐 ${CYAN}${gp}${NC} Mbps  重传 ${rt}  估丢包 ${lp}%"
+
+    if awk -v u="$unshaped_mbps" -v c="$SWEEP_CAP" 'BEGIN{exit !(u+0 > c+0)}'; then
+        echo -e "  ${GREEN}吞吐超过扫描上限 ${SWEEP_CAP} Mbit，跳过拐点扫描（通常无需整形）${NC}"
+        printf 'NO_KNEE=1\nABOVE_CAP=1\nUNSHAPED=%s\nLOSS=%s\n' "$unshaped_mbps" "$unshaped_loss" >"$SWEEP_RESULT"
+        restore_q
+        trap - INT TERM
+        return 3
+    fi
+
+    # 丢包很低 → 无限速器
+    if awk -v l="$lp" -v t="$thresh" 'BEGIN{exit !(l+0 <= t+0)}'; then
+        echo -e "  ${GREEN}丢包很低：端口上未见限速器，不加整形（加了只会限制自己）${NC}"
+        printf 'NO_KNEE=1\nUNSHAPED=%s\nLOSS=%s\n' "$unshaped_mbps" "$unshaped_loss" >"$SWEEP_RESULT"
+        restore_q
+        # 若以前有整形，主动拆掉避免「结果写未设置、网上还限着」
+        if [ -f "$SHAPE_RATE" ] || [ -x "$SHAPE_SCRIPT" ]; then
+            echo -e "  ${CYAN}检测到旧整形，正在移除…${NC}"
+            shape_off
+        fi
+        trap - INT TERM
+        return 3
+    fi
+
+    echo -e "  ${YELLOW}丢包偏高：疑似有限速器，从实测吞吐附近往上扫拐点${NC}"
+
+    # —— 2) 向上扫描 ——
+    echo -e "\n  ${CYAN}[2/3] 拐点扫描${NC}"
+    local start end step r hits j r2 s2 g2 t2 l2 min_lp
+    start=$(awk -v u="$unshaped_mbps" 'BEGIN{s=int(u*0.9/10)*10; if(s<20)s=20; print s}')
+    end=$(awk -v u="$unshaped_mbps" -v n="$nominal" -v c="$SWEEP_CAP" 'BEGIN{
+        e=int(u*1.25/10)*10; if(n>e) e=int(n*1.1/10)*10; if(e>c) e=c; print e}')
+    step=$(awk -v b="$nominal" 'BEGIN{s=int(b/30/10+0.5)*10; if(s<20)s=20; print s}')
+    echo -e "  区间 ${start} → ${end}  步长 ${step}  Mbps"
+    printf '  %-10s %12s %9s %8s  %s\n' "档位" "吞吐Mbps" "重传" "丢包%" "判定"
+
+    base_loss=""
+    last_ok=""
+    broke_at=""
+    for ((r = start; r <= end; r += step)); do
+        apply_test_shaper "$iface" "$r" || {
+            echo -e "  ${YELLOW}无法在 ${r}M 应用测试整形，停止${NC}"
+            break
+        }
+        sleep 1
+        res=$(run_iperf "$host" "$dur" 1 "$PEER_PORT") || res=""
+        if [ -z "$res" ]; then
+            printf '  %-10s %12s %9s %8s  %s\n' "$r" "-" "-" "-" "对端忙/失败"
+            sleep "$GAP"
+            continue
+        fi
+        sgp=$(echo "$res" | awk '{print $1}')
+        rt=$(echo "$res" | awk '{print $2}')
+        gp=$(echo "$res" | awk '{print $3}')
+        lp=$(loss_pct "$rt" "$sgp" "$dur")
+        if [ -z "$base_loss" ] && awk -v l="$lp" -v t="$thresh" 'BEGIN{exit !(l+0 <= t+0)}'; then
+            base_loss=$lp
+        fi
+        # 跳变：超阈值且明显高于本底
+        if awk -v l="$lp" -v t="$thresh" -v b="${base_loss:-0}" 'BEGIN{
+            need=t; if(b>0 && b*5>need) need=b*5; if(need>1) need=1;
+            exit !(l+0 > need)
+        }'; then
+            hits=1
+            min_lp=$lp
+            for j in 2 3; do
+                sleep "$GAP"
+                r2=$(run_iperf "$host" "$dur" 1 "$PEER_PORT") || r2=""
+                [ -z "$r2" ] && continue
+                s2=$(echo "$r2" | awk '{print $1}')
+                t2=$(echo "$r2" | awk '{print $2}')
+                g2=$(echo "$r2" | awk '{print $3}')
+                l2=$(loss_pct "$t2" "$s2" "$dur")
+                printf '  %-10s %12s %9s %8s  %s\n' "${r}(#${j})" "$g2" "$t2" "$l2" "复测"
+                awk -v x="$l2" -v y="$min_lp" 'BEGIN{exit !(x<y)}' && min_lp=$l2
+                if awk -v l="$l2" -v t="$thresh" -v b="${base_loss:-0}" 'BEGIN{
+                    need=t; if(b>0 && b*5>need) need=b*5; if(need>1) need=1;
+                    exit !(l+0 > need)
+                }'; then
+                    hits=$((hits + 1))
+                fi
+            done
+            if [ "$hits" -ge 2 ]; then
+                printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" "$lp" "丢包跳变(${hits}/3)"
+                broke_at=$r
+                break
+            fi
+            printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" "$lp" "瞬时抖动，继续"
+            last_ok=$r
+        else
+            printf '  %-10s %12s %9s %8s  %s\n' "$r" "$gp" "$rt" "$lp" "ok"
+            last_ok=$r
+            [ -z "$base_loss" ] && base_loss=$lp
+        fi
+        sleep "$GAP"
+    done
+
+    # 终点必测（步长可能跳过 end）
+    if [ -z "$broke_at" ] && [ -n "$last_ok" ] && [ "$last_ok" -lt "$end" ] 2>/dev/null; then
+        apply_test_shaper "$iface" "$end" 2>/dev/null && {
+            res=$(run_iperf "$host" "$dur" 1 "$PEER_PORT") || res=""
+            if [ -n "$res" ]; then
+                sgp=$(echo "$res" | awk '{print $1}')
+                rt=$(echo "$res" | awk '{print $2}')
+                gp=$(echo "$res" | awk '{print $3}')
+                lp=$(loss_pct "$rt" "$sgp" "$dur")
+                printf '  %-10s %12s %9s %8s  %s\n' "$end" "$gp" "$rt" "$lp" "终点"
+                if awk -v l="$lp" -v t="$thresh" -v b="${base_loss:-0}" 'BEGIN{
+                    need=t; if(b>0 && b*5>need) need=b*5; if(need>1) need=1;
+                    exit !(l+0 > need)
+                }'; then
+                    broke_at=$end
+                else
+                    last_ok=$end
+                fi
+            fi
+        }
+    fi
+
+    restore_q
+    trap - INT TERM
+
+    echo -e "\n  ${CYAN}[3/3] 结论${NC}"
+    if [ -n "$broke_at" ]; then
+        knee=$broke_at
+        margin=$(calc_shape_margin "$nominal")
+        rec=$((knee - margin))
+        [ "$rec" -lt 1 ] && rec=1
+        # 推荐不低于不限速吞吐的 85%（太低没意义）
+        local floor
+        floor=$(awk -v u="$unshaped_mbps" 'BEGIN{printf "%d", u*0.85}')
+        [ "$rec" -lt "$floor" ] 2>/dev/null && rec=$floor
+        echo -e "  拐点约 ${GREEN}${knee}${NC} Mbit  安全余量 ${margin}  推荐整形 ${GREEN}${rec}${NC} Mbit"
+        printf 'KNEE=%s\nRECOMMEND=%s\nMARGIN=%s\nUNSHAPED=%s\nLOSS=%s\n' \
+            "$knee" "$rec" "$margin" "$unshaped_mbps" "$unshaped_loss" >"$SWEEP_RESULT"
+        return 0
+    fi
+
+    if [ -n "$last_ok" ]; then
+        echo -e "  ${YELLOW}扫完全程未稳定复现跳变；可能无限速器或拐点在区间外${NC}"
+        printf 'NO_KNEE=1\nOUT_OF_RANGE=1\nLAST_OK=%s\nUNSHAPED=%s\n' \
+            "$last_ok" "$unshaped_mbps" >"$SWEEP_RESULT"
+        return 3
+    fi
+    echo -e "  ${RED}扫描无有效样本${NC}"
+    return 1
+}
+
+# 菜单 23：独立扫拐点并可选择应用
+menu_sweep() {
+    echo -e "\n${YELLOW}>>> 限速器拐点扫描 + 可选应用整形${NC}"
+    echo -e "  原理：不限速先跑 → 丢包高则向上扫 → 在拐点下用 HTB+fq pacing 限住突发"
+    echo -e "  ${YELLOW}会消耗真实上行流量（约数 GB / 数分钟，视带宽而定）${NC}"
+    local peer_spec host_port bw rc rec
+    bw=${TUNE_MBPS:-}
+    if [ -z "$bw" ]; then
+        bw=$(ask_bandwidth)
+    fi
+    host_port=$(ask_peer) || {
+        echo -e "  ${YELLOW}无可用对端，已取消${NC}"
+        pause_return
+        return 1
+    }
+    echo -e "  带宽按 ${CYAN}${bw}${NC} Mbps  对端 ${CYAN}${host_port}${NC}"
+    echo -e "  ${YELLOW}开始扫描（真实上行流量）…${NC}"
+    sweep_policer "$host_port" "$bw"
+    rc=$?
+    if [ "$rc" = "0" ] && [ -f "$SWEEP_RESULT" ]; then
+        rec=$(awk -F= '/^RECOMMEND=/{print $2}' "$SWEEP_RESULT")
+        if [ -n "$rec" ]; then
+            if [ "$BATCH" = "1" ]; then
+                shape_apply "$rec"
+            else
+                read -p "  应用整形 ${rec} Mbit？[Y/n]: " _c || true
+                case "$_c" in
+                n | N) echo -e "  已跳过应用（结果在 $SWEEP_RESULT）" ;;
+                *) shape_apply "$rec" ;;
+                esac
+            fi
+        fi
+    fi
+    pause_return
+    return 0
+}
+
+# 一键流程里的整形段：失败只告警
+run_shape_stage() {
+    local bw="$1" peer_spec rc rec
+    echo -e "\n${YELLOW}>>> 阶段：限速器扫描与整形${NC}"
+    peer_spec=$(ask_peer) || {
+        echo -e "  ${YELLOW}整形跳过：无可用对端（基础调优已生效）${NC}"
+        echo -e "  ${CYAN}稍后可用菜单 23 重试，或菜单 24 手填整形值${NC}"
+        return 0
+    }
+    sweep_policer "$peer_spec" "$bw"
+    rc=$?
+    if [ "$rc" = "0" ]; then
+        rec=$(awk -F= '/^RECOMMEND=/{print $2}' "$SWEEP_RESULT" 2>/dev/null)
+        if [ -n "$rec" ]; then
+            # 扫完冷却，避免令牌桶空窗污染「是否生效」的体感
+            echo -e "  冷却 8s 后应用整形…"
+            sleep 8
+            shape_apply "$rec" || echo -e "  ${YELLOW}整形应用未完全成功，可菜单 24 重试${NC}"
+        fi
+    elif [ "$rc" = "3" ]; then
+        echo -e "  ${GREEN}无需整形或未定位拐点；基础调优保留${NC}"
+    else
+        echo -e "  ${YELLOW}扫描失败，整形跳过；基础调优保留${NC}"
+    fi
+    return 0
+}
+
 # ==================================================
 # --- 9. 一键全部（1+2+3+4）---
 # ==================================================
 run_all() {
-    echo -e "\n${YELLOW}>>> 一键全部优化${NC}"
+    echo -e "
+${YELLOW}>>> 一键全部优化（基础调优 + 限速器扫描/整形）${NC}"
 
     # 档位要用户明确选，不能默认给中转档——开 IP 转发对普通业务机是意外的语义变更
-    echo -e "\n  这台机器的角色："
+    echo -e "
+  这台机器的角色："
     echo -e "    ${CYAN}1${NC}) 普通业务机 —— 保守档"
     echo -e "    ${CYAN}2${NC}) 中转/代理/隧道 —— 中转档（+IP 转发 + MSS Clamp）"
     read -p "  选择 [1/2，回车默认 1]: " role
@@ -4315,12 +5408,18 @@ run_all() {
     *) PROFILE=normal ;;
     esac
 
-    read -p "  本机出口带宽 Mbps（回车默认 1000，用于按 BDP 算缓冲区）: " TUNE_MBPS
+    TUNE_MBPS=$(ask_bandwidth)
     case "$TUNE_MBPS" in '' | *[!0-9]*) TUNE_MBPS=1000 ;; esac
 
+    echo -e "
+  将依次：IPv4 优先 → BBR+FQ → 内核参数 → 网卡队列 → 限速扫描/整形"
+    echo -e "  带宽按 ${CYAN}${TUNE_MBPS}${NC} Mbps  档位 ${CYAN}${PROFILE}${NC}"
+    echo -e "  ${YELLOW}整形阶段会跑真实上行流量；公共节点不可用时只跳过整形，基础仍生效${NC}"
+    echo -e "  ${YELLOW}不包含关闭 IPv6（要关请用菜单 3）${NC}"
+    drain_stdin
     read -p "确认执行？[y/N]: " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || {
-        echo -e "${GREEN}已取消。${NC}"
+        echo -e "${GREEN}已取消（未输入 y）。${NC}"
         sleep 1
         return
     }
@@ -4330,31 +5429,46 @@ run_all() {
     enable_bbr
     tune_sysctl
     tune_nic
+    run_shape_stage "$TUNE_MBPS"
     BATCH=0
     TUNE_MBPS=""
 
-    echo -e "\n${GREEN}===== 一键优化完成 =====${NC}"
+    echo -e "
+${GREEN}===== 一键优化完成 =====${NC}"
     draw_line
-    printf "  %-14s : %s\n" "拥塞算法" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-    printf "  %-14s : %s\n" "默认队列" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    printf "  %-14s : %s\n" "somaxconn" "$(sysctl -n net.core.somaxconn 2>/dev/null)"
-    printf "  %-14s : %s MB\n" "缓冲区上限" "$(($(sysctl -n net.core.rmem_max 2>/dev/null || echo 0) / 1024 / 1024))"
-    printf "  %-14s : %s\n" "IPv4 优先" "$(grep -q '^precedence ::ffff:0:0/96  100' "$GAI_CONF" 2>/dev/null && echo 已开启 || echo 未开启)"
-    printf "  %-14s : %s\n" "档位" "$PROFILE"
+    printf "  %-14s : %s
+" "拥塞算法" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    printf "  %-14s : %s
+" "默认队列" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    printf "  %-14s : %s
+" "somaxconn" "$(sysctl -n net.core.somaxconn 2>/dev/null)"
+    printf "  %-14s : %s MB
+" "缓冲区上限" "$(($(sysctl -n net.core.rmem_max 2>/dev/null || echo 0) / 1024 / 1024))"
+    printf "  %-14s : %s
+" "IPv4 优先" "$(grep -q '^precedence ::ffff:0:0/96  100' "$GAI_CONF" 2>/dev/null && echo 已开启 || echo 未开启)"
+    printf "  %-14s : %s
+" "档位" "$PROFILE"
+    _sh=""
+    _dev=$(egress_dev)
+    [ -n "$_dev" ] && _sh=$(tc_rate_mbit "$(tc class show dev "$_dev" 2>/dev/null)")
+    printf "  %-14s : %s
+" "出向整形" "${_sh:+${_sh} Mbit}${_sh:-未设置}"
     draw_line
-    echo -e "  ${CYAN}下一步：菜单 8 看瓶颈到底在哪，菜单 a 测调优前后差异${NC}"
+    echo -e "  ${CYAN}下一步：菜单 20 看瓶颈，菜单 21 测效果，菜单 23 可重扫拐点${NC}"
     pause_return
 }
+
 
 # ==================================================
 # --- 5. 回退 ---
 # ==================================================
 rollback_tune() {
     echo -e "\n${YELLOW}>>> 回退全部优化${NC}"
+    take_tcpo_lock || return 1
     local had_systemd_limits=0
     [ -f "$SYSTEMD_LIMITS_OPT" ] && had_systemd_limits=1
-    # $IPV6_OPT 在这份清单里：菜单 i 关掉的 IPv6 属「本脚本改的状态」，
-    # 菜单 6 承诺「还原成第一次运行前的样子」就必须连它一起还原。
+    # $IPV6_OPT 在这份清单里：菜单 3 关掉的 IPv6 属「本脚本改的状态」，
+    # 菜单 30 承诺「还原成第一次运行前的样子」就必须连它一起还原。
     # 三个 disable_ipv6 key 已在 MANAGED_KEYS 里，运行时值由下面的 restore_managed_keys 写回
     rm -f "$SYSCTL_OPT" "$LEGACY_SYSCTL_OPT" "$NIC_SYSCTL_OPT" "$LIMITS_OPT" "$BBR_OPT" \
         "$SYSTEMD_LIMITS_OPT" \
@@ -4448,6 +5562,33 @@ rollback_tune() {
             echo -e "  已删除 ${_mss_n} 条本脚本加的 MSS Clamp 规则"
     fi
 
+    # 出向 HTB 整形：文件 + unit + 运行时 qdisc 一并清。
+    # 菜单 30 承诺「含 HTB 整形」；只删 sysctl 会把 HTB unit 留在开机重放路径上（审查 #1）。
+    if [ -f "$SHAPE_UNIT" ] || [ -x "$SHAPE_SCRIPT" ] || [ -f "$SHAPE_RATE" ]; then
+        if has_systemd && [ -f "$SHAPE_UNIT" ]; then
+            systemctl disable --now "$(basename "$SHAPE_UNIT")" &>/dev/null
+            rm -f "$SHAPE_UNIT"
+            systemctl daemon-reload &>/dev/null
+        fi
+        rm -f "$SHAPE_SCRIPT" "$SHAPE_RATE" "$SWEEP_RESULT"
+        _sdev=$(egress_dev)
+        if [ -n "$_sdev" ] && command -v tc >/dev/null 2>&1; then
+            _sk=$(tc qdisc show dev "$_sdev" 2>/dev/null | awk 'NR==1{print $2}')
+            if [ "$_sk" = "htb" ]; then
+                if restore_default_qdisc "$_sdev"; then
+                    echo -e "  已移除出向整形（HTB）并恢复 qdisc"
+                else
+                    echo -e "  ${RED}已删整形文件，但 qdisc 恢复失败（$_sdev 可能仍是 htb）${NC}"
+                    echo -e "  ${YELLOW}手动检查: tc qdisc show dev $_sdev${NC}"
+                fi
+            else
+                echo -e "  已移除出向整形配置文件"
+            fi
+        else
+            echo -e "  已移除出向整形配置文件"
+        fi
+    fi
+
     # 停掉并删除 RPS/XPS 的开机应用单元
     if [ -f "$NIC_UNIT" ]; then
         systemctl disable --now "$(basename "$NIC_UNIT")" &>/dev/null
@@ -4455,7 +5596,7 @@ rollback_tune() {
         systemctl daemon-reload &>/dev/null
         echo -e "  已移除开机应用单元 $(basename "$NIC_UNIT")"
     fi
-    # networkd-dispatcher 钩子是另一处状态，unit 不存在时也可能留着（用户只跑过菜单 c）
+    # networkd-dispatcher 钩子是另一处状态，unit 不存在时也可能留着（用户只跑过菜单 8）
     [ -f "$NIC_DISPATCH" ] && {
         rm -f "$NIC_DISPATCH"
         echo -e "  已移除 networkd-dispatcher 钩子"
@@ -4530,7 +5671,7 @@ rollback_tune() {
         echo -e "${GREEN}回退完成：配置文件已清理，受管参数已逐个还原到首次运行前的值${NC}"
     else
         echo -e "${RED}回退未完整：配置文件已清理，但运行时值未能全部写回${NC}"
-        echo -e "  ${YELLOW}请确认 sysctl 可用（包名 procps-ng / procps）后重跑菜单 6，或重启让内核默认接管${NC}"
+        echo -e "  ${YELLOW}请确认 sysctl 可用（包名 procps-ng / procps）后重跑菜单 30，或重启让内核默认接管${NC}"
     fi
     if [ -f "$ORIG_STATE" ]; then
         echo -e "  ${YELLOW}原始值快照保留在 $ORIG_STATE（卸载面板时才删除）${NC}"
@@ -4583,7 +5724,8 @@ while true; do
     # 第三态还要区分「本来就关着」——用户自己关的不该显示成本面板关的
     # 标题跟着动作变：同一个键在已关闭时走恢复分支，写死「关闭 IPv6」会与实际行为相反
     if ipv6_disabled_now; then
-        st_ipv6="${GREEN}[已关闭]${NC}"
+        # 不用绿：绿在本面板表示「优化已开启」；关 IPv6 是关掉协议族，用黄区分
+        st_ipv6="${YELLOW}[已关闭]${NC}"
         lb_ipv6="恢复 IPv6"
     elif [ -f "$IPV6_OPT" ]; then
         st_ipv6="${YELLOW}[配置未生效]${NC}"
@@ -4662,26 +5804,34 @@ while true; do
     _hint=$(version_hint)
     [ -n "$_hint" ] && echo -e "           $_hint"
     echo -e "${YELLOW}==================================================${NC}"
-    echo -e "  ${CYAN}9. 一键全部优化${NC}"
+    echo -e "  ${CYAN}1. 一键全部优化${NC}  （基础 + 限速扫描/整形）"
     draw_line
-    echo -e "  1. IPv4 优先          $st_ipv4"
-    echo -e "  i. $lb_ipv6          $st_ipv6"
-    echo -e "  2. BBR + FQ           $st_bbr"
-    echo -e "  3. 内核参数调优       $st_sysctl"
-    echo -e "  4. 内核参数-中转档    $st_sysctl"
-    echo -e "  5. 网卡队列/RPS/XPS   $st_nic"
-    echo -e "  c. qdisc 立刻生效     $st_qdisc"
+    echo -e "  2. IPv4 优先          $st_ipv4"
+    echo -e "  3. $lb_ipv6          $st_ipv6"
+    echo -e "  4. BBR + FQ           $st_bbr"
+    echo -e "  5. 内核参数 · 普通档  $st_sysctl"
+    echo -e "  6. 内核参数 · 中转档  $st_sysctl"
+    echo -e "  7. 网卡队列/RPS/XPS   $st_nic"
+    echo -e "  8. qdisc 立刻生效     $st_qdisc"
     draw_line
-    echo -e "  ${CYAN}8. 瓶颈诊断${NC}"
-    echo -e "  ${CYAN}a. 调优效果测量${NC}"
-    echo -e "  ${CYAN}b. MTU / PMTU 探测${NC}"
+    echo -e "  ${CYAN}20. 瓶颈诊断${NC}"
+    echo -e "  ${CYAN}21. 调优效果测量${NC}"
+    echo -e "  ${CYAN}22. MTU / PMTU 探测${NC}"
+    echo -e "  ${CYAN}23. 限速器拐点扫描${NC}"
+    echo -e "  ${CYAN}24. 出向整形 开/关${NC}"
     draw_line
-    echo -e "  6. 回退全部优化"
-    echo -e "  7. 更新脚本"
-    echo -e "  q. 卸载面板"
+    echo -e "  30. 回退全部优化"
+    echo -e "  31. 更新脚本"
+    echo -e "  32. 卸载面板"
     echo -e "  0. 退出"
     draw_line
-    echo -e "  当前: 算法 ${GREEN}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${NC}$(bbr_version_label) | 队列 ${GREEN}$(sysctl -n net.core.default_qdisc 2>/dev/null)${NC} | 句柄 ${GREEN}$(ulimit -n)${NC}"
+    _st_shape="无"
+    _st_dev=$(egress_dev)
+    if [ -n "$_st_dev" ]; then
+        _st_r=$(tc_rate_mbit "$(tc class show dev "$_st_dev" 2>/dev/null)")
+        [ -n "$_st_r" ] && _st_shape="${_st_r}M"
+    fi
+    echo -e "  当前: 算法 ${GREEN}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${NC}$(bbr_version_label) | 队列 ${GREEN}$(sysctl -n net.core.default_qdisc 2>/dev/null)${NC} | 整形 ${GREEN}${_st_shape}${NC} | 句柄 ${GREEN}$(ulimit -n)${NC}"
     [ "$DRYRUN" = "1" ] && echo -e "  ${CYAN}[演练模式] 不会写入任何系统文件，退出时打印将写入的内容${NC}"
     draw_line
 
@@ -4691,32 +5841,33 @@ while true; do
         exit 0
     }
     case "$opt" in
-    9) run_all ;;
-    1) set_ipv4_priority ;;
-    # 同一个键既关又开：已关闭时给恢复入口，避免用户为了开回来必须跑菜单 6
-    # （那会把 BBR/缓冲区等全部优化一起回退掉）
-    i | I)
+    1) run_all ;;
+    2) set_ipv4_priority ;;
+    # 同一个键既关又开：已关闭时给恢复入口，避免用户为了开回来必须跑菜单 30
+    3)
         if ipv6_disabled_now; then
             restore_ipv6
         else
             disable_ipv6
         fi
         ;;
-    2) enable_bbr ;;
-    3) PROFILE=normal tune_sysctl ;;
-    4)
+    4) enable_bbr ;;
+    5) PROFILE=normal tune_sysctl ;;
+    6)
         echo -e "\n${YELLOW}中转档会开启 IP 转发 + MSS Clamp，只有中转/代理/隧道节点需要。${NC}"
         read -p "确认使用中转档？[y/N]: " _c
         [[ "$_c" =~ ^[Yy]$ ]] && PROFILE=transit tune_sysctl || echo -e "${GREEN}已取消。${NC}"
         ;;
-    5) tune_nic ;;
-    8) diagnose ;;
-    a | A) measure ;;
-    b | B) probe_mtu ;;
-    c | C) apply_live_qdisc ;;
-    6) rollback_tune && pause_return ;;
-    7) check_update ;;
-    q | Q) uninstall_script ;;
+    7) tune_nic ;;
+    8) apply_live_qdisc ;;
+    20) diagnose ;;
+    21) measure ;;
+    22) probe_mtu ;;
+    23) menu_sweep ;;
+    24) menu_shape ;;
+    30) rollback_tune && pause_return ;;
+    31) check_update ;;
+    32) uninstall_script ;;
     0)
         dryrun_report
         exit 0
